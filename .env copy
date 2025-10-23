@@ -1,0 +1,92 @@
+# =============================================================================
+# PrUn Configuration File
+# =============================================================================
+# Copy this file to .env and fill in your actual values
+# Remove this comment block and the example values below
+
+# =============================================================================
+# CORE SYSTEM CONFIGURATION
+# =============================================================================
+
+# Database paths (automatically managed in database/ folder)
+# DB_PATH, PRIVATE_DB, USER_DB, BOT_DB are automatically set by config.py
+# All databases are stored in ./database/ folder
+
+# State and logging directories
+STATE_DIR=./state
+LOG_LEVEL=INFO
+
+# Market data configuration
+TICK=0.1
+HIST_BUCKET_SECS=300
+
+# =============================================================================
+# FNAR API CONFIGURATION (data.py)
+# =============================================================================
+
+# FNAR API endpoints
+FNAR_API_BASE=https://rest.fnar.net
+PRIVATE_BASE=https://rest.fnar.net
+
+# FNAR credentials (replace with your actual values)
+FNAR_USERNAME=your_username_here
+FNAR_PASSWORD=your_password_here
+FNAR_CSV_API_KEY=your_api_key_here
+
+# Data polling configuration
+POLL_SECS=300
+RETENTION_SEC=3888000
+
+# =============================================================================
+# DISCORD BOT CONFIGURATION (bot.py)
+# =============================================================================
+
+# Discord bot token (get from Discord Developer Portal)
+DISCORD_TOKEN=your_discord_bot_token_here
+
+# Bot owner and target guild
+OWNER_ID=your_discord_user_id_here
+TARGET_GUILD_ID=your_discord_guild_id_here
+
+# Market data source: "db" (read from database) or "n8n" (webhook)
+MARKET_SOURCE=db
+
+# N8N webhook configuration (only used when MARKET_SOURCE=n8n)
+N8N_WEBHOOK_URL=http://localhost:5678/webhook/prun-chat
+N8N_MARKET_REPORT_URL=http://localhost:5678/webhook/MarketReport
+
+# Bot HTTP server configuration
+INBOUND_HOST=0.0.0.0
+INBOUND_PORT=8081
+
+# Discord channel and role IDs (get from Discord)
+REPORT_CHANNEL_ID=your_report_channel_id_here
+ALERT_CHANNEL_ID=your_alert_channel_id_here
+ERROR_LOG_CHANNEL_ID=your_error_log_channel_id_here
+MARKET_ALERT_ROLE_ID=your_market_alert_role_id_here
+
+# Excluded channels/categories (comma-separated IDs)
+EXCLUDED_CATEGORY_IDS=
+EXCLUDED_CHANNEL_IDS=
+
+# Bot naming configuration
+PRIVATE_CATEGORY_NAME=Private Bot Chats
+PUBLIC_BOT_CHANNEL_NAME=bot-commands
+
+# Polling intervals (in seconds)
+MARKET_POLL_SECS=300
+USER_REPORT_SECS=900
+
+# Market analysis thresholds
+ARBITRAGE_MIN_SPREAD_PCT=2.0
+WATCH_EXCHANGES=AI1,CI1,IC1,NC1
+
+# Optional configuration files
+WATCH_RULES_PATH=./watch_rules.json
+
+# =============================================================================
+# MCP SERVER CONFIGURATION (prun-mcp.py)
+# =============================================================================
+
+# MCP server runs on port 8080 by default
+# No additional configuration needed beyond DB paths above

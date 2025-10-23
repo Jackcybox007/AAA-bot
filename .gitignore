@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Secrets / env
+.env
+.env.*
+
+# Local data
+*.db
+*.db-*
+database/
+log/
+logs/
+
+# OS/editor
+.DS_Store
+*.swp

@@ -1,0 +1,24 @@
+# Core HTTP and networking
+requests==2.32.3
+urllib3==2.2.2
+aiohttp==3.9.1
+
+# Discord bot
+discord.py==2.3.2
+
+# Database
+aiosqlite==0.19.0
+
+# Environment and configuration
+python-dotenv==1.0.0
+
+# FastAPI + server
+fastapi==0.115.2
+uvicorn[standard]==0.31.1
+mcp[cli]==1.1.0
+
+# Data validation and serialization
+pydantic==2.9.2
+
+# Standard library modules (included with Python):
+# - asyncio, csv, datetime, hashlib, io, json, logging, math, os, signal, sqlite3, sys, time, typing, pathlib, argparse, base64, glob
