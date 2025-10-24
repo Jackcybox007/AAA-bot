@@ -834,7 +834,7 @@ async def on_member_join(member: discord.Member):
         if tgt:
             await tgt.send(f"Welcome {member.mention}. A private channel has been created for you to chat with the bot.")
         if ch:
-            await ch.send(f"Hi {member.mention}. This is your private channel with the bot.")
+            await ch.send(f"Hi {member.mention}. This is your private channel with the bot. Please read https://discord.com/channels/1418530427471269921/1430844045621723236/1430859783732461608 for more information")
         log.info(f"member_join uid={member.id} guild={member.guild.id} private_ch={(ch.id if ch else None)}")
     except Exception as e:
         log.error(f"on_member_join error: {e}")

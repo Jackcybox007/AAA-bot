@@ -256,6 +256,165 @@ def market_arbitrage_pair(ticker: str, cx_a: str, cx_b: str) -> Dict[str, Any]:
     finally:
         con.close()
 
+# ---- Local Market: arbitrage vs CX ----
+@mcp.tool(description="Find LM trades near an exchange: LM sell < CX ask, or LM buy > CX bid.")
+def lm_arbitrage_near_cx(
+    cx: str,
+    planet_ids_csv: Optional[str] = None,   # e.g. "MOR,HRT,ANT"
+    min_edge_pct: float = 0.5,              # percent
+    limit: int = 50,                        # per side
+    tickers_csv: Optional[str] = None,      # optional whitelist
+    currency: Optional[str] = None          # PriceCurrency filter (e.g. 'NCC')
+) -> Dict[str, Any]:
+    con = db()
+    con.row_factory = sqlite3.Row
+    try:
+        # CX bests
+        cur = con.execute("SELECT ticker,best_bid,best_ask FROM prices WHERE cx=?", (cx,))
+        cxmap = {r["ticker"].upper(): (r["best_bid"], r["best_ask"]) for r in cur.fetchall()}
+
+        # Filters
+        params_sell: List[Any] = []
+        params_buy:  List[Any] = []
+
+        where_parts = ["Price IS NOT NULL", "MaterialTicker IS NOT NULL"]
+        if planet_ids_csv:
+            pids = [p.strip() for p in planet_ids_csv.split(",") if p.strip()]
+            if pids:
+                marks = ",".join("?" for _ in pids)
+                where_parts.append(f"PlanetNaturalId IN ({marks})")
+                params_sell += pids
+                params_buy  += pids
+        if tickers_csv:
+            tcks = [t.strip().upper() for t in tickers_csv.split(",") if t.strip()]
+            if tcks:
+                marks = ",".join("?" for _ in tcks)
+                where_parts.append(f"UPPER(MaterialTicker) IN ({marks})")
+                params_sell += tcks
+                params_buy  += tcks
+        if currency:
+            where_parts.append("PriceCurrency = ?")
+            params_sell.append(currency)
+            params_buy.append(currency)
+
+        where_sql = " AND ".join(where_parts) if where_parts else "1=1"
+
+        # Pull LM rows
+        sell_rows = con.execute(f"""
+            SELECT ContractNaturalId,PlanetNaturalId,PlanetName,CreatorCompanyName,CreatorCompanyCode,
+                   MaterialName,MaterialTicker,MaterialAmount,Price,PriceCurrency,DeliveryTime,
+                   CreationTimeEpochMs,ExpiryTimeEpochMs
+            FROM LM_sell
+            WHERE {where_sql}
+        """, params_sell).fetchall()
+
+        buy_rows = con.execute(f"""
+            SELECT ContractNaturalId,PlanetNaturalId,PlanetName,CreatorCompanyName,CreatorCompanyCode,
+                   MaterialName,MaterialTicker,MaterialAmount,Price,PriceCurrency,DeliveryTime,
+                   CreationTimeEpochMs,ExpiryTimeEpochMs
+            FROM LM_buy
+            WHERE {where_sql}
+        """, params_buy).fetchall()
+
+        def edge_under_ask(row) -> Optional[Dict[str, Any]]:
+            t = (row["MaterialTicker"] or "").upper()
+            price = row["Price"]
+            bb, ba = cxmap.get(t, (None, None))
+            if ba is None or ba <= 0 or price is None:
+                return None
+            if price >= ba:
+                return None
+            edge_pct = round(100.0 * (ba - price) / ba, 3)
+            if edge_pct < min_edge_pct:
+                return None
+            return {
+                "ticker": t,
+                "planet_id": row["PlanetNaturalId"],
+                "planet": row["PlanetName"],
+                "type": "LM_sell_vs_CX_ask",
+                "lm_price": price,
+                "cx_best_ask": ba,
+                "edge_pct": edge_pct,
+                "amount": row["MaterialAmount"],
+                "currency": row["PriceCurrency"],
+                "company": row["CreatorCompanyName"],
+                "company_code": row["CreatorCompanyCode"],
+                "delivery": row["DeliveryTime"],
+                "created": ts_iso(row["CreationTimeEpochMs"]) if row["CreationTimeEpochMs"] else None,
+                "expiry": ts_iso(row["ExpiryTimeEpochMs"]) if row["ExpiryTimeEpochMs"] else None,
+                "contract_id": row["ContractNaturalId"],
+            }
+
+        def edge_over_bid(row) -> Optional[Dict[str, Any]]:
+            t = (row["MaterialTicker"] or "").upper()
+            price = row["Price"]
+            bb, ba = cxmap.get(t, (None, None))
+            if bb is None or bb <= 0 or price is None:
+                return None
+            if price <= bb:
+                return None
+            edge_pct = round(100.0 * (price - bb) / bb, 3)
+            if edge_pct < min_edge_pct:
+                return None
+            return {
+                "ticker": t,
+                "planet_id": row["PlanetNaturalId"],
+                "planet": row["PlanetName"],
+                "type": "LM_buy_vs_CX_bid",
+                "lm_price": price,
+                "cx_best_bid": bb,
+                "edge_pct": edge_pct,
+                "amount": row["MaterialAmount"],
+                "currency": row["PriceCurrency"],
+                "company": row["CreatorCompanyName"],
+                "company_code": row["CreatorCompanyCode"],
+                "delivery": row["DeliveryTime"],
+                "created": ts_iso(row["CreationTimeEpochMs"]) if row["CreationTimeEpochMs"] else None,
+                "expiry": ts_iso(row["ExpiryTimeEpochMs"]) if row["ExpiryTimeEpochMs"] else None,
+                "contract_id": row["ContractNaturalId"],
+            }
+
+        sell_edges = [e for r in sell_rows if (e := edge_under_ask(r))]
+        buy_edges  = [e for r in buy_rows  if (e := edge_over_bid(r))]
+
+        sell_edges.sort(key=lambda x: (-x["edge_pct"], x["ticker"], x["planet_id"]))
+        buy_edges.sort(key=lambda x: (-x["edge_pct"], x["ticker"], x["planet_id"]))
+
+        return {
+            "cx": cx,
+            "planet_filter": planet_ids_csv or "ALL",
+            "min_edge_pct": min_edge_pct,
+            "sell_undercut": sell_edges[:max(1, int(limit))],
+            "buy_overbid": buy_edges[:max(1, int(limit))],
+            "generated_at": now_iso(),
+        }
+    finally:
+        con.close()
+
+# ---- Materials search ----
+@mcp.tool(description="Search for materials on the LM by ticker or name substring.")
+def mats_search(q: str, limit: int = 50, category: Optional[str] = None) -> Dict[str, Any]:
+    con = db()
+    con.row_factory = sqlite3.Row
+    try:
+        like = f"%{q.strip()}%" if q else "%"
+        params: List[Any] = [like.upper(), like.upper()]
+        where = "WHERE UPPER(ticker) LIKE ? OR UPPER(name) LIKE ?"
+        if category:
+            where += " AND UPPER(category)=?"
+            params.append(category.strip().upper())
+        rows = con.execute(f"""
+            SELECT ticker,name,category,weight,volume
+            FROM materials
+            {where}
+            ORDER BY ticker ASC
+            LIMIT ?
+        """, params + [max(1, int(limit))]).fetchall()
+        return {"items": [dict(r) for r in rows], "count": len(rows), "generated_at": now_iso()}
+    finally:
+        con.close()
+
+
 # ---- Materials ----
 @mcp.tool(description="Get material info by ticker.")
 def materials_name(ticker: str) -> Dict[str, Any]:
