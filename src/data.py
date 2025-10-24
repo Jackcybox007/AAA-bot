@@ -192,7 +192,7 @@ CREATE TABLE IF NOT EXISTS user_balances(
 -- Ensure ON CONFLICT(...) targets exist on old installs
 CREATE UNIQUE INDEX IF NOT EXISTS ux_user_inventory ON user_inventory(username, ticker, natural_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_user_cxos      ON user_cxos(username, order_id);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_user_balances  ON user_balances(username, currency);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_user_balances  ON user_balances(username, currency); 
 """
 
 async def init_dbs():

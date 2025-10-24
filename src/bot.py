@@ -1,32 +1,28 @@
+# src/bot.py
 """
 PrUn Discord Market Hub Bot
 
-A guild-scoped Discord bot for market data monitoring and analysis.
+Guild-scoped Discord bot for market data monitoring and analysis.
 
-Features:
-    - Slash commands (guild-scoped only)
-    - Webhook bridge to n8n for AI chat integration
-    - Periodic market snapshots (server and private watchlists)
-    - Per-user FNAR CSV key registration
-    - Private channel management
-    - Market data analysis and reporting
-    - Owner-only admin commands
-
-Usage:
-    python bot.py
+Changes in this build:
+- Single DB-backed lock per user (active_lock=1). Set at dispatch. Release only when inbound callback includes the same discordID.
+- Auto-release stale locks after 15 minutes if no callback arrives.
+- Owner command /admin_release_lock to manually release a user's lock.
+- Forward only messages that start with '?' to n8n.
+- Suppress CommandNotFound noise from prefixed messages; no prefixed text commands are used.
 """
 
-# Standard library imports
+# Standard library
 import asyncio
 import hashlib
 import json
 import logging
 import os
 import signal
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
-# Third-party imports
+# Third-party
 import aiohttp
 import aiosqlite
 import discord
@@ -35,15 +31,14 @@ from discord import app_commands, Object as _Obj
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-# Local imports
+# Local
 from config import config
 
 # ========= env / config =========
 load_dotenv()
 
-# Use centralized configuration
 DISCORD_TOKEN = config.DISCORD_TOKEN
-MARKET_SOURCE = config.MARKET_SOURCE
+MARKET_SOURCE = config.MARKET_SOURCE  # "db" | "n8n"
 N8N_WEBHOOK_URL = config.N8N_WEBHOOK_URL
 N8N_MARKET_REPORT_URL = config.N8N_MARKET_REPORT_URL
 PRUN_DB_PATH = config.DB_PATH
@@ -70,6 +65,8 @@ DEFAULT_EXCHANGES = config.WATCH_EXCHANGES
 WATCH_RULES_PATH = config.WATCH_RULES_PATH
 MAX_DISCORD_MSG_LEN = config.MAX_DISCORD_MSG_LEN
 LOG_SNIPPET = config.LOG_SNIPPET
+
+LOCK_TTL_SECONDS = 15 * 60  # 15 minutes
 
 # ========= logging =========
 log = config.setup_logging("prun-bot")
@@ -104,12 +101,12 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="?", intents=intents)
 http_session: Optional[aiohttp.ClientSession] = None
 
 # DB connections
-db: Optional[aiosqlite.Connection] = None
-userdb: Optional[aiosqlite.Connection] = None
+db: Optional[aiosqlite.Connection] = None          # bot.db
+userdb: Optional[aiosqlite.Connection] = None      # user.db
 
 # in-memory
 _watch_rules: List[Dict[str, Any]] = []
@@ -119,6 +116,9 @@ _start_time = datetime.now(timezone.utc)
 # ========= utils =========
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def now_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
 
 def is_owner(user: discord.abc.User) -> bool:
     return int(user.id) == OWNER_ID
@@ -225,6 +225,10 @@ CREATE TABLE IF NOT EXISTS user_meta(
   guild_id INTEGER NOT NULL,
   user_id  INTEGER NOT NULL,
   private_channel_id INTEGER,
+  total_public_msgs  INTEGER NOT NULL DEFAULT 0,   -- legacy usage counter
+  total_private_msgs INTEGER NOT NULL DEFAULT 0,   -- legacy usage counter
+  active_lock        INTEGER NOT NULL DEFAULT 0,   -- 0 or 1: in-flight request lock
+  lock_acquired_at   INTEGER NOT NULL DEFAULT 0,   -- unix ts when lock set
   PRIMARY KEY(guild_id, user_id)
 );
 """
@@ -248,11 +252,35 @@ def _ex_out(cx: Optional[str]) -> Optional[str]:
 
 async def db_init():
     assert db is not None
-    await db.executescript(SCHEMA_SQL); await db.commit()
+    await db.executescript(SCHEMA_SQL)
+    await db.commit()
+    await _ensure_user_meta_columns()
 
 async def userdb_init():
     assert userdb is not None
     await userdb.executescript(USER_SCHEMA_SQL); await userdb.commit()
+
+# ---- schema backfill ----
+async def _ensure_user_meta_columns():
+    """Backfill columns for older installs."""
+    assert db is not None
+    cols = []
+    async with db.execute("PRAGMA table_info(user_meta)") as cur:
+        async for _, name, *_ in cur:
+            cols.append(name)
+    sqls = []
+    if "total_public_msgs" not in cols:
+        sqls.append("ALTER TABLE user_meta ADD COLUMN total_public_msgs INTEGER NOT NULL DEFAULT 0")
+    if "total_private_msgs" not in cols:
+        sqls.append("ALTER TABLE user_meta ADD COLUMN total_private_msgs INTEGER NOT NULL DEFAULT 0")
+    if "active_lock" not in cols:
+        sqls.append("ALTER TABLE user_meta ADD COLUMN active_lock INTEGER NOT NULL DEFAULT 0")
+    if "lock_acquired_at" not in cols:
+        sqls.append("ALTER TABLE user_meta ADD COLUMN lock_acquired_at INTEGER NOT NULL DEFAULT 0")
+    for s in sqls:
+        await db.execute(s)
+    if sqls:
+        await db.commit()
 
 # ---- DB helpers (log to dbops) ----
 async def db_add_server_watch(guild_id: int, ticker: str, exchange: Optional[str]):
@@ -331,30 +359,11 @@ async def db_get_private_channel(gid: int, uid: int) -> Optional[int]:
     dbops.info(f"user_meta GET guild={gid} user={uid} private_channel_id={val}")
     return val
 
-# user.db helpers
-async def user_set_key(discord_id: int, key: str):
-    assert userdb is not None
-    ts = int(datetime.now(timezone.utc).timestamp())
-    await userdb.execute(
-        "INSERT INTO users(discord_id,fio_api_key,username,created_at,updated_at) VALUES(?,?,?,?,?) "
-        "ON CONFLICT(discord_id) DO UPDATE SET fio_api_key=excluded.fio_api_key, updated_at=excluded.updated_at",
-        (str(discord_id), key, None, ts, ts)
-    ); await userdb.commit()
-    msg = f"user_key UPSERT discord_id={discord_id} key_len={len(key)}"
-    log.info(msg); dbops.info(msg)
-
-async def user_get_key(discord_id: int) -> Optional[str]:
-    assert userdb is not None
-    cur = await userdb.execute("SELECT fio_api_key FROM users WHERE discord_id=?", (str(discord_id),))
-    row = await cur.fetchone()
-    val = row[0] if row else None
-    dbops.info(f"user_key GET discord_id={discord_id} exists={bool(val)}")
-    return val
-
+# ========= user.db helpers =========
 async def user_upsert(discord_id: int, fio_api_key: Optional[str], username: Optional[str]):
     """Upsert FNAR key and optional in-game username."""
     assert userdb is not None
-    ts = int(datetime.now(timezone.utc).timestamp())
+    ts = now_ts()
     await userdb.execute(
         "INSERT INTO users(discord_id,fio_api_key,username,created_at,updated_at) VALUES(?,?,?,?,?) "
         "ON CONFLICT(discord_id) DO UPDATE SET "
@@ -366,17 +375,105 @@ async def user_upsert(discord_id: int, fio_api_key: Optional[str], username: Opt
     await userdb.commit()
     dbops.info(f"user UPSERT id={discord_id} key_set={bool(fio_api_key)} username_set={bool(username)}")
 
+async def user_get_key(discord_id: int) -> Optional[str]:
+    assert userdb is not None
+    cur = await userdb.execute("SELECT fio_api_key FROM users WHERE discord_id=?", (str(discord_id),))
+    row = await cur.fetchone()
+    val = row[0] if row else None
+    dbops.info(f"user_key GET discord_id={discord_id} exists={bool(val)}")
+    return val
+
+# ========= DB-backed single active request lock =========
+async def _begin_immediate(conn: aiosqlite.Connection):
+    await conn.execute("BEGIN IMMEDIATE")
+
+async def is_user_private_channel(guild: discord.Guild, channel: discord.abc.GuildChannel, user_id: int) -> bool:
+    ch_id = await db_get_private_channel(guild.id, user_id)
+    if ch_id and int(ch_id) == int(channel.id):
+        return True
+    cat = getattr(channel, "category", None)
+    if cat and cat.name == PRIVATE_CATEGORY_NAME:
+        topic = getattr(channel, "topic", "") or ""
+        if f"private-bot:{user_id}" in topic:
+            return True
+    return False
+
+async def acquire_user_lock(guild_id: int, user_id: int) -> bool:
+    """
+    Atomic 1-slot lock per user across the guild using user_meta.active_lock.
+    Returns True if acquired, False if already locked.
+    """
+    assert db is not None
+    try:
+        await _begin_immediate(db)
+        await db.execute(
+            "INSERT INTO user_meta(guild_id,user_id,active_lock,lock_acquired_at) VALUES(?,?,0,0) "
+            "ON CONFLICT(guild_id,user_id) DO NOTHING",
+            (guild_id, user_id),
+        )
+        cur = await db.execute(
+            "SELECT active_lock FROM user_meta WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        val = int(row[0] or 0) if row else 0
+        if val >= 1:
+            await db.execute("ROLLBACK")
+            return False
+        await db.execute(
+            "UPDATE user_meta SET active_lock=1, lock_acquired_at=? WHERE guild_id=? AND user_id=?",
+            (now_ts(), guild_id, user_id),
+        )
+        await db.commit()
+        return True
+    except Exception as e:
+        log.error(f"acquire_user_lock error: {e}")
+        try: await db.execute("ROLLBACK")
+        except Exception: pass
+        return False
+
+async def release_user_lock(guild_id: int, user_id: int) -> None:
+    """Release the user's single lock."""
+    assert db is not None
+    try:
+        await _begin_immediate(db)
+        await db.execute(
+            "UPDATE user_meta SET active_lock=0, lock_acquired_at=0 WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+        await db.commit()
+    except Exception as e:
+        log.error(f"release_user_lock error: {e}")
+        try: await db.execute("ROLLBACK")
+        except Exception: pass
+
+# ========= stale lock reaper =========
+@tasks.loop(seconds=60)
+async def stale_lock_reaper():
+    """Auto-release locks older than LOCK_TTL_SECONDS."""
+    try:
+        assert db is not None
+        cutoff = now_ts() - LOCK_TTL_SECONDS
+        await db.execute(
+            "UPDATE user_meta SET active_lock=0, lock_acquired_at=0 WHERE active_lock=1 AND lock_acquired_at>0 AND lock_acquired_at<?",
+            (cutoff,),
+        )
+        await db.commit()
+    except Exception as e:
+        log.error(f"stale_lock_reaper error: {e}")
+
+@stale_lock_reaper.before_loop
+async def before_reaper():
+    await bot.wait_until_ready()
+
 # ========= slash sync cleanup (dedupe) =========
 async def sync_slash_clean():
-    """Clear global commands then sync to the target guild to prevent duplicates."""
-    # Clear all GLOBAL commands
     bot.tree.clear_commands(guild=None)
-    await bot.tree.sync(guild=None)      # push empty global set
-    # Sync to one guild only
+    await bot.tree.sync(guild=None)
     synced = await bot.tree.sync(guild=_G)
     log.info(f"slash synced guild={TARGET_GUILD_ID} count={len(synced)}")
 
-# ========= market I/O (PRUN DB or n8n) =========
+# ========= market I/O =========
 async def load_watch_rules():
     global _watch_rules
     try:
@@ -413,6 +510,7 @@ async def n8n_snapshot(tickers: List[str], exchanges: List[str]) -> Dict[str, Di
         return {}
 
 async def db_snapshot(items: List[Tuple[str, Optional[str]]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Return {ticker: {cx: {bid,ask,ts}}} using prices only. No books dependency."""
     if not items:
         return {}
     tickers = sorted({t.upper() for t, _ in items})
@@ -431,20 +529,7 @@ async def db_snapshot(items: List[Tuple[str, Optional[str]]]) -> Dict[str, Dict[
                 if not row:
                     continue
                 bb, ba, ts_val = row["best_bid"], row["best_ask"], row["ts"]
-                bid_qty = ask_qty = None
-                if bb is not None:
-                    r2 = await (await con.execute(
-                        "SELECT SUM(qty) q FROM books WHERE cx=? AND ticker=? AND side='bid' AND price=?",
-                        (cx, t, bb)
-                    )).fetchone()
-                    bid_qty = int(r2["q"] or 0)
-                if ba is not None:
-                    r3 = await (await con.execute(
-                        "SELECT SUM(qty) q FROM books WHERE cx=? AND ticker=? AND side='ask' AND price=?",
-                        (cx, t, ba)
-                    )).fetchone()
-                    ask_qty = int(r3["q"] or 0)
-                out[t][cx] = {"bid": bb, "ask": ba, "bid_qty": bid_qty, "ask_qty": ask_qty, "ts": ts_val}
+                out[t][cx] = {"bid": bb, "ask": ba, "ts": ts_val}
         return out
 
 async def market_snapshot(items: List[Tuple[str, Optional[str]]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
@@ -614,15 +699,18 @@ async def user_private_loop():
 async def before_user_private():
     await bot.wait_until_ready()
 
-# ========= HTTP inbound bridge =========
+# ========= HTTP inbound bridge (also releases user locks) =========
 async def handle_health(request: web.Request) -> web.StreamResponse:
     return web.json_response({"ok": True, "service": "prun-discord-bridge", "time": now_iso(), "source": MARKET_SOURCE})
 
 async def handle_incoming(request: web.Request) -> web.StreamResponse:
+    """Inbound from n8n. Echo to Discord. Release user lock when discordID matches."""
     try:
         data = await request.json()
     except Exception:
         return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    # Required fields to display
     for k in ("message", "channelID", "serverID"):
         if k not in data:
             return web.json_response({"ok": False, "error": f"missing_{k}"}, status=400)
@@ -633,7 +721,8 @@ async def handle_incoming(request: web.Request) -> web.StreamResponse:
     except ValueError:
         return web.json_response({"ok": False, "error": "channelID_not_int"}, status=400)
     server_id = str(data.get("serverID", "0"))
-    log.info(f"inbound msg len={len(msg_text)} ch={channel_id} srv={server_id} snip='{_snippet(msg_text)}'")
+    discord_id = str(data.get("discordID", ""))  # needed to release
+    log.info(f"inbound msg len={len(msg_text)} ch={channel_id} srv={server_id} uid={discord_id or '-'} snip='{_snippet(msg_text)}'")
 
     channel = bot.get_channel(channel_id)
     if channel is None:
@@ -648,8 +737,17 @@ async def handle_incoming(request: web.Request) -> web.StreamResponse:
             channel = None
     if channel is None:
         log.error(f"inbound: channel not found channelID={channel_id} serverID={server_id}")
+        # Attempt lock release anyway if IDs provided
+        try:
+            gid = int(server_id)
+            uid = int(discord_id) if discord_id.isdigit() else None
+            if gid > 0 and uid is not None:
+                await release_user_lock(gid, uid)
+        except Exception:
+            pass
         return web.json_response({"ok": False, "error": "channel_not_found"}, status=404)
 
+    # Post to channel
     try:
         if len(msg_text) > MAX_DISCORD_MSG_LEN:
             chunks = chunk_text(msg_text, MAX_DISCORD_MSG_LEN)
@@ -658,10 +756,20 @@ async def handle_incoming(request: web.Request) -> web.StreamResponse:
                 await channel.send(c)
         else:
             await channel.send(msg_text)
-        return web.json_response({"ok": True})
     except Exception as e:
         log.error(f"inbound send failed: {e}")
-        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    # Release user lock only if discordID present and valid
+    try:
+        gid = int(server_id)
+        uid = int(discord_id) if discord_id.isdigit() else None
+        if gid > 0 and uid is not None:
+            await release_user_lock(gid, uid)
+            log.info(f"released user lock gid={gid} uid={uid}")
+    except Exception as e:
+        log.error(f"inbound release lock error: {e}")
+
+    return web.json_response({"ok": True})
 
 async def start_http_server() -> web.AppRunner:
     app = web.Application()
@@ -679,8 +787,6 @@ async def on_ready():
         h = DiscordErrorHandler(bot, ERROR_LOG_CHANNEL_ID)
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logging.getLogger().addHandler(h)
-
-    await load_watch_rules()
 
     for g in bot.guilds:
         if g.id != TARGET_GUILD_ID:
@@ -701,11 +807,20 @@ async def on_ready():
         market_report_loop.start()
     if not user_private_loop.is_running():
         user_private_loop.start()
+    if not stale_lock_reaper.is_running():
+        stale_lock_reaper.start()
 
     try:
         await sync_slash_clean()
     except Exception as e:
         log.error(f"slash sync failed: {e}")
+
+# Suppress CommandNotFound from prefixed text messages
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    log.error(f"command error: {error}")
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -724,44 +839,53 @@ async def on_member_join(member: discord.Member):
     except Exception as e:
         log.error(f"on_member_join error: {e}")
 
+# ========= message handler: single DB-backed lock, '?' only =========
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user or getattr(message.author, "bot", False):
         return
     if not message.guild or message.guild.id != TARGET_GUILD_ID:
         return
-    log.debug(f"msg uid={message.author.id} ch={message.channel.id} guild={message.guild.id} len={len(message.content)} excluded={is_excluded(message.channel)}")
-    if not is_excluded(message.channel):
-        payload = {
-            "message": message.content or "",
-            "channelID": str(message.channel.id),
-            "serverID": str(message.guild.id),
-            "discordID": str(message.author.id),
-        }
-        if message.attachments and not payload["message"]:
-            payload["message"] = " ".join(a.url for a in message.attachments)
-        try:
-            assert http_session is not None
-            async with http_session.post(N8N_WEBHOOK_URL, json=payload, timeout=180) as resp:
-                txt = await resp.text()
-                log.info(f"webhook tx status={resp.status} req_len={len(payload['message'])} resp_bytes={len(txt)}")
-                if resp.status == 200:
-                    try:
-                        data = await resp.json()
-                        reply = data.get("message") or data.get("reply")
-                        if reply:
-                            await safe_send(message.channel, reply)
-                    except Exception:
-                        if txt:
-                            await safe_send(message.channel, txt)
-                else:
-                    log.error(f"webhook HTTP {resp.status}: {_snippet(txt)}")
-        except Exception as e:
-            log.error(f"webhook exception: {e}")
-    await bot.process_commands(message)
 
-# ========= slash commands (guild-scoped) =========
-# --- Info / QoL ---
+    content = message.content or ""
+    if not content.startswith("?"):
+        return
+    if is_excluded(message.channel):
+        return
+
+    user_id = int(message.author.id)
+    guild_id = int(message.guild.id)
+
+    # Acquire single user lock. If taken, reject.
+    got_lock = await acquire_user_lock(guild_id, user_id)
+    if not got_lock:
+        await safe_send(message.channel, "You already have an active request. Wait for the previous response or ask an admin to release it.")
+        return
+
+    await safe_send(message.channel, "Processing your request, Please wait")
+
+    # Forward to n8n. Lock is released only via inbound callback.
+    payload = {
+        "message": content.replace("?", "", 1),
+        "channelID": str(message.channel.id),
+        "serverID": str(guild_id),
+        "discordID": str(user_id),
+    }
+    try:
+        assert http_session is not None
+        async with http_session.post(N8N_WEBHOOK_URL, json=payload, timeout=180) as resp:
+            txt = await resp.text()
+            log.info(f"n8n tx status={resp.status} bytes={len(txt)} uid={user_id}")
+            if resp.status != 200:
+                log.error(f"n8n HTTP {resp.status}: {_snippet(txt)}")
+                # keep lock; will auto-release by TTL if n8n fails to callback
+    except Exception as e:
+        log.error(f"webhook exception: {e}")
+        # keep lock; will auto-release by TTL
+
+    # Do not call bot.process_commands(message). Slash commands are handled separately.
+
+# ========= slash commands =========
 @bot.tree.command(name="ping", description="Bot latency and uptime")
 @app_commands.guilds(_G)
 async def ping_cmd(interaction: discord.Interaction):
@@ -822,10 +946,7 @@ async def help_cmd(interaction: discord.Interaction):
     username="Your FIO username"
 )
 async def register_cmd(interaction: discord.Interaction, fio_api_key: str, username: str):
-    # persist key and optional username
     await user_upsert(interaction.user.id, fio_api_key, username)
-
-    # ensure private channel exists and is cached
     try:
         cat = await find_or_create_private_category(interaction.guild)
         in_private = (channel_category_id(interaction.channel) == cat.id)
@@ -835,7 +956,6 @@ async def register_cmd(interaction: discord.Interaction, fio_api_key: str, usern
                 await db_cache_private_channel(interaction.guild.id, interaction.user.id, ch.id)
     except Exception as e:
         log.error(f"register ensure private failed: {e}")
-
     msg = "Key saved." + (f" Username set to '{username}'." if username else "")
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -1033,56 +1153,72 @@ async def health_cmd(interaction: discord.Interaction):
 def _owner_guard(i: discord.Interaction) -> bool:
     return is_owner(i.user)
 
-@bot.tree.command(name="resync", description="Owner: prune duplicates and resync slash commands")
+@bot.tree.command(name="admin_delete_all", description="Owner: delete all messages in a channel")
 @app_commands.guilds(_G)
-async def resync_cmd(i: discord.Interaction):
+@app_commands.describe(channel="Target text channel. Defaults to the current channel.")
+async def admin_delete_all(i: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    if not _owner_guard(i):
+        await i.response.send_message("Not authorized.", ephemeral=True); return
+
+    ch = channel or (i.channel if isinstance(i.channel, discord.TextChannel) else None)
+    if ch is None:
+        await i.response.send_message("This is not a text channel.", ephemeral=True); return
+
+    # Check basic perms
+    me = i.guild.me
+    perms = ch.permissions_for(me)
+    if not (perms.manage_messages and perms.read_message_history and perms.view_channel):
+        await i.response.send_message("Missing permissions: need Manage Messages, View Channel, and Read Message History.", ephemeral=True)
+        return
+
+    await i.response.defer(ephemeral=True, thinking=True)
+
+    deleted_total = 0
+
+    # 1) Bulk purge messages younger than 14 days
+    try:
+        while True:
+            # purge returns list of deleted messages (<=1000 each pass)
+            batch = await ch.purge(limit=1000, bulk=True, check=lambda m: True, oldest_first=False)
+            deleted_total += len(batch)
+            if len(batch) == 0:
+                break
+    except Exception as e:
+        log.error(f"/admin_delete_all bulk purge error: {e}")
+
+    # 2) Individually delete any remaining older messages
+    try:
+        async for msg in ch.history(limit=None, oldest_first=True):
+            try:
+                await msg.delete()
+                deleted_total += 1
+            except Exception:
+                pass
+            # be gentle with rate limits
+            await asyncio.sleep(0.2)
+    except Exception as e:
+        log.error(f"/admin_delete_all history delete error: {e}")
+
+    await i.followup.send(f"Done. Deleted ≈ {deleted_total} messages in {ch.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="admin_release_lock", description="Owner: release a user's active lock")
+@app_commands.guilds(_G)
+@app_commands.describe(member="Target member to release lock for")
+async def admin_release_lock(i: discord.Interaction, member: discord.Member):
+    if not _owner_guard(i):
+        await i.response.send_message("Not authorized.", ephemeral=True); return
+    await release_user_lock(i.guild.id, member.id)
+    await i.response.send_message(f"Released lock for {member.mention}.", ephemeral=True)
+
+@bot.tree.command(name="admin_resync", description="Owner: resync slash commands")
+@app_commands.guilds(_G)
+async def admin_resync(i: discord.Interaction):
     if not _owner_guard(i):
         await i.response.send_message("Not authorized.", ephemeral=True); return
     try:
         await sync_slash_clean()
         await i.response.send_message("Resynced.", ephemeral=True)
-    except Exception as e:
-        await i.response.send_message(f"error: {e}", ephemeral=True)
-
-@bot.tree.command(name="admin_set_report_channel", description="Owner: set report channel")
-@app_commands.guilds(_G)
-@app_commands.describe(channel="Target text channel")
-async def admin_set_report_channel(i: discord.Interaction, channel: discord.TextChannel):
-    if not _owner_guard(i):
-        await i.response.send_message("Not authorized.", ephemeral=True); return
-    global REPORT_CHANNEL_ID
-    REPORT_CHANNEL_ID = int(channel.id)
-    await i.response.send_message(f"REPORT_CHANNEL_ID set to {REPORT_CHANNEL_ID}.", ephemeral=True)
-
-@bot.tree.command(name="admin_set_error_channel", description="Owner: set error log channel")
-@app_commands.guilds(_G)
-@app_commands.describe(channel="Target text channel")
-async def admin_set_error_channel(i: discord.Interaction, channel: discord.TextChannel):
-    if not _owner_guard(i):
-        await i.response.send_message("Not authorized.", ephemeral=True); return
-    global ERROR_LOG_CHANNEL_ID
-    ERROR_LOG_CHANNEL_ID = int(channel.id)
-    await i.response.send_message(f"ERROR_LOG_CHANNEL_ID set to {ERROR_LOG_CHANNEL_ID}. Restart recommended.", ephemeral=True)
-
-@bot.tree.command(name="admin_force_private", description="Owner: create/ensure a private channel for a member")
-@app_commands.guilds(_G)
-@app_commands.describe(member="Target member")
-async def admin_force_private(i: discord.Interaction, member: discord.Member):
-    if not _owner_guard(i):
-        await i.response.send_message("Not authorized.", ephemeral=True); return
-    ch = await ensure_member_private_channel(i.guild, member)
-    if ch and db:
-        await db_cache_private_channel(i.guild.id, member.id, ch.id)
-    await i.response.send_message(f"Private channel: {ch.mention if ch else 'failed'}", ephemeral=True)
-
-@bot.tree.command(name="admin_sync", description="Owner: force slash sync (guild only)")
-@app_commands.guilds(_G)
-async def admin_sync(i: discord.Interaction):
-    if not _owner_guard(i):
-        await i.response.send_message("Not authorized.", ephemeral=True); return
-    try:
-        await sync_slash_clean()
-        await i.response.send_message("Synced.", ephemeral=True)
     except Exception as e:
         await i.response.send_message(f"error: {e}", ephemeral=True)
 
