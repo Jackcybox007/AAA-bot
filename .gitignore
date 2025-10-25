@@ -12,6 +12,7 @@ __pycache__/
 database/
 log/
 logs/
+db_*
 
 # OS/editor
 .DS_Store
