@@ -9,9 +9,9 @@ over HTTP. Provides comprehensive market data analysis, asset management,
 and trading tools for Prosperous Universe.
 
 Notes:
-- Works with the current public DB schema: prices(cx,ticker,best_bid,best_ask,ts),
+- Works with the public DB schema: prices(cx,ticker,best_bid,best_ask,PP7,PP30,ts),
   price_history(cx,ticker,bid,ask,ts), materials(ticker,name,category,weight,volume).
-- Does not rely on an order-book ("books") table or a "last" column.
+- No dependency on an order-book ("books") table or a "last" column.
 """
 
 # Standard library imports
@@ -40,6 +40,12 @@ STATE_DIR = config.STATE_DIR
 TICK = config.TICK
 HIST_BUCKET_SECS = config.HIST_BUCKET_SECS
 
+# Reports written by market.py
+REPORT_DIR = os.path.join("tmp", "reports")
+REPORT_UNIVERSE_FILE = os.path.join(REPORT_DIR, "universe", "report.md")
+REPORT_SERVER_FILE   = os.path.join(REPORT_DIR, "server",   "report.md")
+REPORT_USERS_DIR     = os.path.join(REPORT_DIR, "users")
+
 # Setup logging
 log = config.setup_logging("prun-mcp")
 
@@ -66,14 +72,13 @@ def udb():
     return con
 
 def ts_iso(ts_ms: int) -> str:
-    # ts stored as ms in data.py
     return datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).isoformat()
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def init_local():
-    # Public/local helper tables kept minimal. No dependency on 'books'.
+    # Public/local helper tables kept minimal.
     con = db(); cur = con.cursor()
     cur.executescript("""
     PRAGMA journal_mode=WAL;
@@ -112,7 +117,7 @@ def init_local():
     """)
     con.commit(); con.close()
 
-    # private DB tables mirror prun-private.db from data.py
+    # private DB tables
     pc = pdb(); pcur = pc.cursor()
     pcur.executescript("""
     PRAGMA journal_mode=WAL;
@@ -170,7 +175,7 @@ def init_local():
 
 init_local()
 
-# -------- market utils (no books dependency) --------
+# -------- market utils --------
 def best_row(con, cx: str, ticker: str) -> Tuple[Optional[float], Optional[float]]:
     r = con.execute("SELECT best_bid, best_ask FROM prices WHERE cx=? AND ticker=?",
                     (cx, ticker.upper())).fetchone()
@@ -180,7 +185,7 @@ def best_row(con, cx: str, ticker: str) -> Tuple[Optional[float], Optional[float
 
 def mid(bb: Optional[float], ba: Optional[float]) -> Optional[float]:
     if bb is None or ba is None: return None
-    return round((bb+ba)/2.0, 1)
+    return round((bb+ba)/2.0, 3)
 
 # ====================== MCP TOOLS ======================
 
@@ -216,7 +221,7 @@ def state_get(name: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# ---- Market: best, spread ----
+# ---- Market: best, spread for single ticker ----
 @mcp.tool(description="Best bid/ask for a ticker on an exchange.")
 def market_best(cx: str, ticker: str) -> Dict[str, Any]:
     con = db()
@@ -233,12 +238,52 @@ def market_spread(cx: str, ticker: str) -> Dict[str, Any]:
         bb, ba = best_row(con, cx, ticker)
         if bb is None or ba is None:
             return {"spread": None, "mid": None, "spread_pct": None}
-        s = round(ba-bb, 1); m = mid(bb,ba)
-        return {"spread": s, "mid": m, "spread_pct": (round(100.0*s/m, 3) if m else None)}
+        s = round(ba - bb, 3); m = mid(bb, ba)
+        return {"spread": s, "mid": m, "spread_pct": (round(100.0 * s / m, 3) if m else None)}
     finally:
         con.close()
 
-# ---- Market: arbitrage ----
+# ---- Market: spreads across ALL tickers on ONE CX ----
+@mcp.tool(description="Spread%% across all tickers on one CX. Sorted by tightest or widest.")
+def cx_best_spreads(
+    cx: str,
+    order: Literal["tightest","widest"] = "tightest",
+    limit: int = 200
+) -> Dict[str, Any]:
+    """
+    spread_pct = ((ask - bid) / mid) * 100
+    mid = (bid + ask)/2
+    """
+    con = db(); con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT ticker, best_bid, best_ask FROM prices WHERE cx=?",
+            (cx.upper(),)
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            bb, ba = r["best_bid"], r["best_ask"]
+            if bb is None or ba is None:  # need both sides
+                continue
+            m = (bb + ba) / 2.0
+            if m <= 0:
+                continue
+            spr = ba - bb
+            pct = 100.0 * spr / m
+            out.append({
+                "ticker": r["ticker"].upper(),
+                "bid": round(bb, 3),
+                "ask": round(ba, 3),
+                "mid": round(m, 3),
+                "spread": round(spr, 3),
+                "spread_pct": round(pct, 3)
+            })
+        out.sort(key=lambda x: x["spread_pct"], reverse=(order == "widest"))
+        return {"cx": cx.upper(), "count": len(out), "items": out[:max(1, int(limit))], "at": now_iso()}
+    finally:
+        con.close()
+
+# ---- Market: arbitrage pair ----
 @mcp.tool(description="Bid-ask edge between two exchanges for one ticker.")
 def market_arbitrage_pair(ticker: str, cx_a: str, cx_b: str) -> Dict[str, Any]:
     con = db()
@@ -250,170 +295,157 @@ def market_arbitrage_pair(ticker: str, cx_a: str, cx_b: str) -> Dict[str, Any]:
         edge_ab = (a["best_bid"] - b["best_ask"]) if (a["best_bid"] is not None and b["best_ask"] is not None) else None
         edge_ba = (b["best_bid"] - a["best_ask"]) if (b["best_bid"] is not None and a["best_ask"] is not None) else None
         return {"ticker": ticker.upper(), "buy_at": cx_b, "sell_at": cx_a,
-                "edge_ab": (round(edge_ab,1) if edge_ab is not None else None),
+                "edge_ab": (round(edge_ab,3) if edge_ab is not None else None),
                 "buy_at_rev": cx_a, "sell_at_rev": cx_b,
-                "edge_ba": (round(edge_ba,1) if edge_ba is not None else None)}
+                "edge_ba": (round(edge_ba,3) if edge_ba is not None else None)}
     finally:
         con.close()
 
-# ---- Local Market: arbitrage vs CX ----
-@mcp.tool(description="Find LM trades near an exchange: LM sell < CX ask, or LM buy > CX bid.")
+# ---- Local Market: arbitrage vs CX (minimal) ----
+@mcp.tool(description="LM sells below CX ask or LM buys above CX bid. Minimal fields.")
 def lm_arbitrage_near_cx(
     cx: str,
-    planet_ids_csv: Optional[str] = None,   # e.g. "MOR,HRT,ANT"
-    min_edge_pct: float = 0.5,              # percent
-    limit: int = 50,                        # per side
-    tickers_csv: Optional[str] = None,      # optional whitelist
-    currency: Optional[str] = None          # PriceCurrency filter (e.g. 'NCC')
+    planet_ids_csv: Optional[str] = None,
+    min_edge_pct: float = 0.5,
+    limit: int = 50,
+    tickers_csv: Optional[str] = None,
+    currency: Optional[str] = None
 ) -> Dict[str, Any]:
-    con = db()
-    con.row_factory = sqlite3.Row
+    con = db(); con.row_factory = sqlite3.Row
     try:
-        # CX bests
-        cur = con.execute("SELECT ticker,best_bid,best_ask FROM prices WHERE cx=?", (cx,))
-        cxmap = {r["ticker"].upper(): (r["best_bid"], r["best_ask"]) for r in cur.fetchall()}
+        cxmap = {
+            r["ticker"].upper(): (r["best_bid"], r["best_ask"])
+            for r in con.execute("SELECT ticker,best_bid,best_ask FROM prices WHERE cx=?", (cx,))
+        }
 
-        # Filters
-        params_sell: List[Any] = []
-        params_buy:  List[Any] = []
-
+        params_sell: List[Any] = []; params_buy: List[Any] = []
         where_parts = ["Price IS NOT NULL", "MaterialTicker IS NOT NULL"]
+
         if planet_ids_csv:
             pids = [p.strip() for p in planet_ids_csv.split(",") if p.strip()]
             if pids:
                 marks = ",".join("?" for _ in pids)
                 where_parts.append(f"PlanetNaturalId IN ({marks})")
-                params_sell += pids
-                params_buy  += pids
+                params_sell += pids; params_buy += pids
         if tickers_csv:
             tcks = [t.strip().upper() for t in tickers_csv.split(",") if t.strip()]
             if tcks:
                 marks = ",".join("?" for _ in tcks)
                 where_parts.append(f"UPPER(MaterialTicker) IN ({marks})")
-                params_sell += tcks
-                params_buy  += tcks
+                params_sell += tcks; params_buy += tcks
         if currency:
             where_parts.append("PriceCurrency = ?")
-            params_sell.append(currency)
-            params_buy.append(currency)
+            params_sell.append(currency); params_buy.append(currency)
 
-        where_sql = " AND ".join(where_parts) if where_parts else "1=1"
+        where_sql = " AND ".join(where_parts)
 
-        # Pull LM rows
         sell_rows = con.execute(f"""
-            SELECT ContractNaturalId,PlanetNaturalId,PlanetName,CreatorCompanyName,CreatorCompanyCode,
-                   MaterialName,MaterialTicker,MaterialAmount,Price,PriceCurrency,DeliveryTime,
-                   CreationTimeEpochMs,ExpiryTimeEpochMs
-            FROM LM_sell
-            WHERE {where_sql}
+            SELECT PlanetNaturalId,PlanetName,MaterialTicker,MaterialAmount,Price,PriceCurrency
+            FROM LM_sell WHERE {where_sql}
         """, params_sell).fetchall()
 
         buy_rows = con.execute(f"""
-            SELECT ContractNaturalId,PlanetNaturalId,PlanetName,CreatorCompanyName,CreatorCompanyCode,
-                   MaterialName,MaterialTicker,MaterialAmount,Price,PriceCurrency,DeliveryTime,
-                   CreationTimeEpochMs,ExpiryTimeEpochMs
-            FROM LM_buy
-            WHERE {where_sql}
+            SELECT PlanetNaturalId,PlanetName,MaterialTicker,MaterialAmount,Price,PriceCurrency
+            FROM LM_buy WHERE {where_sql}
         """, params_buy).fetchall()
 
-        def edge_under_ask(row) -> Optional[Dict[str, Any]]:
-            t = (row["MaterialTicker"] or "").upper()
-            price = row["Price"]
-            bb, ba = cxmap.get(t, (None, None))
-            if ba is None or ba <= 0 or price is None:
-                return None
-            if price >= ba:
-                return None
+        sell_edges: List[Dict[str, Any]] = []
+        for r in sell_rows:
+            t = (r["MaterialTicker"] or "").upper()
+            price = r["Price"]; bb, ba = cxmap.get(t, (None, None))
+            if ba is None or price is None or price >= ba: continue
             edge_pct = round(100.0 * (ba - price) / ba, 3)
-            if edge_pct < min_edge_pct:
-                return None
-            return {
-                "ticker": t,
-                "planet_id": row["PlanetNaturalId"],
-                "planet": row["PlanetName"],
-                "type": "LM_sell_vs_CX_ask",
-                "lm_price": price,
-                "cx_best_ask": ba,
-                "edge_pct": edge_pct,
-                "amount": row["MaterialAmount"],
-                "currency": row["PriceCurrency"],
-                "company": row["CreatorCompanyName"],
-                "company_code": row["CreatorCompanyCode"],
-                "delivery": row["DeliveryTime"],
-                "created": ts_iso(row["CreationTimeEpochMs"]) if row["CreationTimeEpochMs"] else None,
-                "expiry": ts_iso(row["ExpiryTimeEpochMs"]) if row["ExpiryTimeEpochMs"] else None,
-                "contract_id": row["ContractNaturalId"],
-            }
+            if edge_pct >= min_edge_pct:
+                sell_edges.append({
+                    "ticker": t,
+                    "planet_id": r["PlanetNaturalId"],
+                    "planet": r["PlanetName"],
+                    "lm_price": price,
+                    "cx_ask": ba,
+                    "edge_pct": edge_pct,
+                    "amount": r["MaterialAmount"],
+                    "ccy": r["PriceCurrency"],
+                })
 
-        def edge_over_bid(row) -> Optional[Dict[str, Any]]:
-            t = (row["MaterialTicker"] or "").upper()
-            price = row["Price"]
-            bb, ba = cxmap.get(t, (None, None))
-            if bb is None or bb <= 0 or price is None:
-                return None
-            if price <= bb:
-                return None
+        buy_edges: List[Dict[str, Any]] = []
+        for r in buy_rows:
+            t = (r["MaterialTicker"] or "").upper()
+            price = r["Price"]; bb, ba = cxmap.get(t, (None, None))
+            if bb is None or price is None or price <= bb: continue
             edge_pct = round(100.0 * (price - bb) / bb, 3)
-            if edge_pct < min_edge_pct:
-                return None
-            return {
-                "ticker": t,
-                "planet_id": row["PlanetNaturalId"],
-                "planet": row["PlanetName"],
-                "type": "LM_buy_vs_CX_bid",
-                "lm_price": price,
-                "cx_best_bid": bb,
-                "edge_pct": edge_pct,
-                "amount": row["MaterialAmount"],
-                "currency": row["PriceCurrency"],
-                "company": row["CreatorCompanyName"],
-                "company_code": row["CreatorCompanyCode"],
-                "delivery": row["DeliveryTime"],
-                "created": ts_iso(row["CreationTimeEpochMs"]) if row["CreationTimeEpochMs"] else None,
-                "expiry": ts_iso(row["ExpiryTimeEpochMs"]) if row["ExpiryTimeEpochMs"] else None,
-                "contract_id": row["ContractNaturalId"],
-            }
-
-        sell_edges = [e for r in sell_rows if (e := edge_under_ask(r))]
-        buy_edges  = [e for r in buy_rows  if (e := edge_over_bid(r))]
+            if edge_pct >= min_edge_pct:
+                buy_edges.append({
+                    "ticker": t,
+                    "planet_id": r["PlanetNaturalId"],
+                    "planet": r["PlanetName"],
+                    "lm_price": price,
+                    "cx_bid": bb,
+                    "edge_pct": edge_pct,
+                    "amount": r["MaterialAmount"],
+                    "ccy": r["PriceCurrency"],
+                })
 
         sell_edges.sort(key=lambda x: (-x["edge_pct"], x["ticker"], x["planet_id"]))
         buy_edges.sort(key=lambda x: (-x["edge_pct"], x["ticker"], x["planet_id"]))
 
-        return {
-            "cx": cx,
-            "planet_filter": planet_ids_csv or "ALL",
-            "min_edge_pct": min_edge_pct,
-            "sell_undercut": sell_edges[:max(1, int(limit))],
-            "buy_overbid": buy_edges[:max(1, int(limit))],
-            "generated_at": now_iso(),
-        }
+        return {"cx": cx, "min_edge_pct": min_edge_pct,
+                "sell": sell_edges[:max(1, int(limit))],
+                "buy":  buy_edges[:max(1, int(limit))],
+                "at": now_iso()}
     finally:
         con.close()
 
-# ---- Materials search ----
-@mcp.tool(description="Search for materials on the LM by ticker or name substring.")
-def mats_search(q: str, limit: int = 50, category: Optional[str] = None) -> Dict[str, Any]:
-    con = db()
-    con.row_factory = sqlite3.Row
+# ---- Local Market: simple search (minimal) ----
+@mcp.tool(description="Search LM buy/sell. Minimal fields. side in {'buy','sell','both'}.")
+def lm_search(
+    q: str,
+    side: Literal["buy","sell","both"] = "both",
+    planet_ids_csv: Optional[str] = None,
+    currency: Optional[str] = None,
+    limit: int = 100
+) -> Dict[str, Any]:
+    con = db(); con.row_factory = sqlite3.Row
     try:
         like = f"%{q.strip()}%" if q else "%"
+        where_parts = ["Price IS NOT NULL",
+                       "(UPPER(MaterialTicker) LIKE ? OR UPPER(MaterialName) LIKE ?)"]
         params: List[Any] = [like.upper(), like.upper()]
-        where = "WHERE UPPER(ticker) LIKE ? OR UPPER(name) LIKE ?"
-        if category:
-            where += " AND UPPER(category)=?"
-            params.append(category.strip().upper())
-        rows = con.execute(f"""
-            SELECT ticker,name,category,weight,volume
-            FROM materials
-            {where}
-            ORDER BY ticker ASC
-            LIMIT ?
-        """, params + [max(1, int(limit))]).fetchall()
-        return {"items": [dict(r) for r in rows], "count": len(rows), "generated_at": now_iso()}
+
+        if planet_ids_csv:
+            pids = [p.strip() for p in planet_ids_csv.split(",") if p.strip()]
+            if pids:
+                marks = ",".join("?" for _ in pids)
+                where_parts.append(f"PlanetNaturalId IN ({marks})")
+                params += pids
+        if currency:
+            where_parts.append("PriceCurrency = ?")
+            params.append(currency)
+
+        where_sql = " AND ".join(where_parts)
+        lim = max(1, int(limit))
+
+        def _run(table: str) -> List[Dict[str, Any]]:
+            rows = con.execute(f"""
+                SELECT PlanetNaturalId,PlanetName,MaterialTicker,MaterialAmount,Price,PriceCurrency
+                FROM {table} WHERE {where_sql}
+                ORDER BY UPPER(MaterialTicker), PlanetNaturalId
+                LIMIT ?
+            """, params + [lim]).fetchall()
+            return [{
+                "ticker": r["MaterialTicker"].upper(),
+                "planet_id": r["PlanetNaturalId"],
+                "planet": r["PlanetName"],
+                "price": r["Price"],
+                "amount": r["MaterialAmount"],
+                "ccy": r["PriceCurrency"],
+            } for r in rows]
+
+        out: Dict[str, Any] = {"at": now_iso()}
+        if side in ("sell","both"): out["sell"] = _run("LM_sell")
+        if side in ("buy","both"):  out["buy"]  = _run("LM_buy")
+        return out
     finally:
         con.close()
-
 
 # ---- Materials ----
 @mcp.tool(description="Get material info by ticker.")
@@ -488,19 +520,19 @@ def assets_value(cx: str, method: Literal["bid","ask","mid"]="mid", base: Option
             if not px: price=None
             else:
                 bb,ba = px["best_bid"], px["best_ask"]
-                price = {"bid": bb, "ask": ba, "mid": (None if (bb is None or ba is None) else round((bb+ba)/2.0,1))}[method]
+                price = {"bid": bb, "ask": ba, "mid": (None if (bb is None or ba is None) else round((bb+ba)/2.0,3))}[method]
             val = (r["qty"]*price) if (price is not None) else None
             if val is not None: total += val
-            items.append({"ticker": r["ticker"], "base": r["base"], "qty": r["qty"], "price": price, "value": (round(val,1) if val is not None else None)})
-        return {"cx": cx, "method": method, "total_value": round(total,1), "items": items}
+            items.append({"ticker": r["ticker"], "base": r["base"], "qty": r["qty"], "price": price, "value": (round(val,3) if val is not None else None)})
+        return {"cx": cx, "method": method, "total_value": round(total,3), "items": items}
     finally:
         con.close()
 
-# ---- History (price_history from data.py, no 'last') ----
+# ---- History (price_history) ----
 def _row_to_hist_dict(r: sqlite3.Row) -> Dict[str, Any]:
     bb = r["bid"]; ba = r["ask"]
-    mid_v = (None if (bb is None or ba is None) else round((bb+ba)/2.0, 1))
-    spr_v = (None if (bb is None or ba is None) else round(ba-bb, 1))
+    mid_v = (None if (bb is None or ba is None) else round((bb+ba)/2.0, 3))
+    spr_v = (None if (bb is None or ba is None) else round(ba-bb, 3))
     return {
         "ts": int(r["ts"]),
         "time": ts_iso(r["ts"]),
@@ -569,13 +601,39 @@ def history_stats(cx: str, ticker: str, minutes: int = 1440) -> Dict[str, Any]:
         spreads = [(r["ask"] - r["bid"]) for r in rows if (r["bid"] is not None and r["ask"] is not None)]
         def _agg(arr):
             if not arr: return {"min": None, "max": None, "avg": None}
-            return {"min": round(min(arr),1), "max": round(max(arr),1), "avg": round(sum(arr)/len(arr),3)}
+            return {"min": round(min(arr),3), "max": round(max(arr),3), "avg": round(sum(arr)/len(arr),3)}
         return {"cx": cx, "ticker": ticker.upper(), "count": len(rows), "since_ms": cutoff_ms,
                 "bid": _agg(bids), "ask": _agg(asks), "spread": _agg(spreads)}
     finally:
         con.close()
 
-# ---- Private user data (username-scoped, aligns with data.py) ----
+# ---- Reports (read pre-rendered markdown from tmp/reports) ----
+def _read_text(path: str) -> Optional[str]:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+    except Exception as e:
+        log.error(f"read report error {path}: {e}")
+    return None
+
+@mcp.tool(description="Read rendered market report markdown. kind in {'universe','server','user'}. For 'user', pass user_id.")
+def market_report(kind: Literal["universe","server","user"]="server", user_id: Optional[str]=None) -> Dict[str, Any]:
+    if kind == "universe":
+        txt = _read_text(REPORT_UNIVERSE_FILE)
+        return {"kind": "universe", "path": REPORT_UNIVERSE_FILE, "exists": bool(txt), "content": txt}
+    if kind == "server":
+        txt = _read_text(REPORT_SERVER_FILE)
+        return {"kind": "server", "path": REPORT_SERVER_FILE, "exists": bool(txt), "content": txt}
+    if kind == "user":
+        if not user_id:
+            return {"error": "user_id required for kind='user'"}
+        p = os.path.join(REPORT_USERS_DIR, str(user_id), "report.md")
+        txt = _read_text(p)
+        return {"kind": "user", "user_id": str(user_id), "path": p, "exists": bool(txt), "content": txt}
+    return {"error": "invalid kind"}
+
+# ---- Private user data ----
 @mcp.tool(description="Show masked FNAR CSV key and username for a Discord user.")
 def user_key_info(discord_id: str) -> Dict[str, Any]:
     con = udb()

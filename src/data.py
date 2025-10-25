@@ -32,8 +32,10 @@ import asyncio
 import csv
 import io
 import logging
+import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
+from collections import defaultdict
 
 import aiohttp
 import aiosqlite
@@ -50,8 +52,22 @@ PRUN_DB_PATH = config.DB_PATH
 PVT_DB_PATH = config.PRIVATE_DB
 USER_DB_PATH = config.USER_DB
 
+# --- tuning knobs (after other config imports) ---
+HTTP_MAX_CONNECTIONS   = getattr(config, "HTTP_MAX_CONNECTIONS", 1000)   # hard cap
+CONCURRENCY_LM         = getattr(config, "CONCURRENCY_LM", 256)
+CONCURRENCY_CXPC       = getattr(config, "CONCURRENCY_CXPC", 512)
+DB_BATCH_SIZE          = getattr(config, "DB_BATCH_SIZE", 500)
+
 EXCHANGES = config.EXCHANGES
 LM_EXTRA_PLANET_IDS = ["MOR", "HRT", "ANT", "BEN", "HUB", "ARC"]
+MAJOR_CX = ("NC1", "CI1", "IC1", "AI1")                 
+CX_CODES = ("NC1", "NC2", "CI1", "CI2", "IC1", "AI1")
+VALID_CX = set(("NC1", "NC2", "CI1", "CI2", "IC1", "AI1"))
+UN_CODE  = "UN"               
+
+CHART_ALLOWED = {"MINUTE_FIVE": 7, "HOUR_TWO": 30}  # days of retention per interval
+
+PRUNPLANNER_EXCHANGE_URL = "http://api.prunplanner.org/csv/exchange?api_key=GY0aQcLcAM4y1gSeoPWaxCi2y1Vn9VKO"  # CSV: TICKER,EXCHANGECODE,ASK,BID,AVG,SUPPLY,DEMAND,TRADED
 
 log = config.setup_logging("data.py")
 
@@ -119,6 +135,8 @@ CREATE TABLE IF NOT EXISTS prices(
   ticker TEXT NOT NULL,
   best_bid REAL,
   best_ask REAL,
+  PP7 REAL,          -- NEW
+  PP30 REAL,         -- NEW
   ts INTEGER NOT NULL,
   PRIMARY KEY(cx, ticker)
 );
@@ -297,21 +315,127 @@ CREATE TABLE IF NOT EXISTS user_balances(
 );
 """
 
+PRICES_CHART_EXPECTED_COLS = [
+  "cx","ticker","mat_id","interval","ts",
+  "open","close","high","low","volume","traded"
+]
+
+PRICES_CHART_SCHEMA = """
+CREATE TABLE IF NOT EXISTS prices_chart_history(
+  cx       TEXT    NOT NULL,
+  ticker   TEXT    NOT NULL,
+  mat_id   INTEGER NOT NULL,
+  interval TEXT    NOT NULL,   -- MINUTE_FIVE or HOUR_TWO
+  ts       INTEGER NOT NULL,   -- DateEpochMs
+  open   REAL,
+  close  REAL,
+  high   REAL,
+  low    REAL,
+  volume REAL,
+  traded INTEGER,
+  PRIMARY KEY(cx,ticker,interval,ts)
+);
+CREATE INDEX IF NOT EXISTS ix_pch_ts ON prices_chart_history(ts);
+"""
+
+# --- HTTP cache for conditional GETs (ETag / Last-Modified) ---
+HTTP_CACHE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS http_cache(
+  url TEXT PRIMARY KEY,
+  etag TEXT,
+  last_modified TEXT,
+  fetched_ts INTEGER
+);
+"""
+
+# ---------- helper: db ----------
 async def ensure_private_schema(pvt: aiosqlite.Connection):
     await _ensure_table(pvt, "user_inventory", PVT_EXPECTED["user_inventory"], PVT_SCHEMA_INV)
     await _ensure_table(pvt, "user_cxos",      PVT_EXPECTED["user_cxos"],      PVT_SCHEMA_CXOS)
     await _ensure_table(pvt, "user_balances",  PVT_EXPECTED["user_balances"],  PVT_SCHEMA_BAL)
 
+async def ensure_prices_chart_schema(pub: aiosqlite.Connection):
+    await _ensure_table(pub, "prices_chart_history", PRICES_CHART_EXPECTED_COLS, PRICES_CHART_SCHEMA)
+
+async def ensure_http_cache(pub: aiosqlite.Connection):
+    await pub.executescript(HTTP_CACHE_SCHEMA); await pub.commit()
+
+async def _http_cache_get(pub: aiosqlite.Connection, url: str) -> Tuple[Optional[str], Optional[str]]:
+    row = await (await pub.execute("SELECT etag,last_modified FROM http_cache WHERE url=?", (url,))).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+async def _http_cache_put(pub: aiosqlite.Connection, url: str, etag: Optional[str], last_modified: Optional[str]):
+    await pub.execute(
+        "INSERT INTO http_cache(url,etag,last_modified,fetched_ts) VALUES(?,?,?,?) "
+        "ON CONFLICT(url) DO UPDATE SET etag=excluded.etag, last_modified=excluded.last_modified, fetched_ts=excluded.fetched_ts",
+        (url, etag, last_modified, _now_ms())
+    )
+
 async def init_dbs():
     pub = await aiosqlite.connect(PRUN_DB_PATH)
     await pub.executescript(PUB_SCHEMA); await pub.commit()
     await ensure_lm_ship_schema(pub)
+    await ensure_http_cache(pub)  # add
 
     pvt = await aiosqlite.connect(PVT_DB_PATH)
     await ensure_private_schema(pvt)
 
     users = await aiosqlite.connect(USER_DB_PATH)
     return pub, pvt, users
+
+
+# ---------- helper: pp7d, pp30d ----------
+async def ensure_prices_pp_columns(pub: aiosqlite.Connection):
+    cols: List[str] = []
+    async with pub.execute("PRAGMA table_info(prices)") as cur:
+        async for _cid, name, *_ in cur:
+            cols.append((name or "").lower())
+    # migrate existing DBs
+    if "pp7" not in cols:
+        await pub.execute("ALTER TABLE prices ADD COLUMN PP7 REAL")
+    if "pp30" not in cols:
+        await pub.execute("ALTER TABLE prices ADD COLUMN PP30 REAL")
+    await pub.commit()
+
+async def _pp_means(pub: aiosqlite.Connection, cx: str, ticker: str, now_ms: int) -> Tuple[Optional[float], Optional[float]]:
+    """Return (PP7, PP30) as mean of mid = (bid+ask)/2 over the last 7/30 days."""
+    cutoff30 = now_ms - 30*24*3600*1000
+    cutoff7  = now_ms - 7*24*3600*1000
+    rows = await (await pub.execute(
+        "SELECT ts,bid,ask FROM price_history WHERE cx=? AND ticker=? AND ts>=? ORDER BY ts ASC",
+        (cx, ticker, cutoff30)
+    )).fetchall()
+    mids30: List[Tuple[int, float]] = []
+    for ts, b, a in rows:
+        if b is None or a is None:
+            continue
+        mids30.append((int(ts), (float(b)+float(a))/2.0))
+    if not mids30:
+        return None, None
+    pp30_vals = [m for _ts, m in mids30]
+    pp7_vals  = [m for ts, m in mids30 if ts >= cutoff7]
+    def _mean(v: List[float]) -> Optional[float]:
+        return (sum(v)/len(v)) if v else None
+    return _mean(pp7_vals), _mean(pp30_vals)
+
+# ---------- helper: fetch json data ----------
+async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[Any]:
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                log.warning(f"GET {url} -> {resp.status}")
+                return None
+            if resp.status == 200:
+                log.info(f"GET {url} -> {resp.status}")
+            return await resp.json(content_type=None)
+    except Exception as e:
+        log.error(f"fetch_json error url={url} err={e}")
+        return None
+
+# ---------- helper: materials maps ----------
+async def material_id_map(pub: aiosqlite.Connection) -> Dict[str, int]:
+    rows = await (await pub.execute("SELECT ticker FROM materials ORDER BY ticker ASC")).fetchall()
+    return {t: i for i, (t,) in enumerate(rows)}
 
 # ---------- loaders: PUBLIC ----------
 async def load_public_materials(session: aiohttp.ClientSession, pub: aiosqlite.Connection):
@@ -336,6 +460,98 @@ async def load_public_materials(session: aiohttp.ClientSession, pub: aiosqlite.C
         )
     await pub.commit()
     log.info("materials upserted")
+
+async def load_public_prices_prunplanner(session: aiohttp.ClientSession, pub: aiosqlite.Connection):
+    await ensure_prices_pp_columns(pub)
+
+    rows = await fetch_csv(session, PRUNPLANNER_EXCHANGE_URL)
+    if not rows:
+        return
+
+    ts = _now_ms()
+    # collect per-ticker quotes seen this tick
+    # by_ticker[ticker][cx] = (bid, ask)
+    by_ticker: Dict[str, Dict[str, Tuple[Optional[float], Optional[float]]]] = defaultdict(dict)
+
+    await pub.execute("BEGIN")
+
+    # 1) upsert raw CX quotes (NC1, NC2, CI1, CI2, IC1, AI1) and build cache
+    for r in rows:
+        ticker = _to_str(r.get("TICKER"))
+        cx     = _to_str(r.get("EXCHANGECODE"))
+        ask    = _to_float(r.get("ASK"))
+        bid    = _to_float(r.get("BID"))
+        if not ticker or not cx:
+            continue
+        if cx not in VALID_CX:
+            continue
+        if ask is None and bid is None:
+            continue
+
+        by_ticker[ticker][cx] = (bid, ask)
+
+        # history tick for the concrete CX
+        await pub.execute(
+            "INSERT OR IGNORE INTO price_history(cx,ticker,bid,ask,ts) VALUES(?,?,?,?,?)",
+            (cx, ticker, bid, ask, ts)
+        )
+
+        # rolling PP7 / PP30 for the concrete CX
+        pp7, pp30 = await _pp_means(pub, cx, ticker, ts)
+
+        # snapshot
+        await pub.execute(
+            "INSERT INTO prices(cx,ticker,best_bid,best_ask,PP7,PP30,ts) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(cx,ticker) DO UPDATE SET "
+            "best_bid=excluded.best_bid, best_ask=excluded.best_ask, "
+            "PP7=excluded.PP7, PP30=excluded.PP30, ts=excluded.ts",
+            (cx, ticker, bid, ask, pp7, pp30, ts)
+        )
+
+    # 2) synthesize UN = average of the four majors (XX1)
+    for ticker, cxmap in by_ticker.items():
+        bids = []
+        asks = []
+        for m in MAJOR_CX:
+            pair = cxmap.get(m)
+            if not pair:
+                continue
+            b, a = pair
+            if b is not None:
+                bids.append(b)
+            if a is not None:
+                asks.append(a)
+
+        un_bid = sum(bids) / len(bids) if bids else None
+        un_ask = sum(asks) / len(asks) if asks else None
+        if un_bid is None and un_ask is None:
+            continue
+
+        # history tick for UN
+        await pub.execute(
+            "INSERT OR IGNORE INTO price_history(cx,ticker,bid,ask,ts) VALUES(?,?,?,?,?)",
+            (UN_CODE, ticker, un_bid, un_ask, ts)
+        )
+
+        # PP7 / PP30 for UN are computed from UN’s own history
+        pp7_un, pp30_un = await _pp_means(pub, UN_CODE, ticker, ts)
+
+        # snapshot for UN
+        await pub.execute(
+            "INSERT INTO prices(cx,ticker,best_bid,best_ask,PP7,PP30,ts) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(cx,ticker) DO UPDATE SET "
+            "best_bid=excluded.best_bid, best_ask=excluded.best_ask, "
+            "PP7=excluded.PP7, PP30=excluded.PP30, ts=excluded.ts",
+            (UN_CODE, ticker, un_bid, un_ask, pp7_un, pp30_un, ts)
+        )
+
+    await pub.commit()
+
+    # retention
+    cutoff = int((time.time() - RETENTION_SEC) * 1000)
+    await pub.execute("DELETE FROM price_history WHERE ts < ?", (cutoff,))
+    await pub.commit()
+
 
 async def load_public_prices(session: aiohttp.ClientSession, pub: aiosqlite.Connection):
     rows = await fetch_csv(session, f"{PUBLIC_BASE}/csv/prices")
@@ -369,6 +585,94 @@ async def load_public_prices(session: aiohttp.ClientSession, pub: aiosqlite.Conn
     await pub.commit()
     cutoff = int((time.time() - RETENTION_SEC) * 1000)
     await pub.execute("DELETE FROM price_history WHERE ts < ?", (cutoff,))
+    await pub.commit()
+
+async def load_public_prices_chart_history(session: aiohttp.ClientSession, pub: aiosqlite.Connection):
+    await ensure_prices_chart_schema(pub)
+
+    id_map = await material_id_map(pub)
+    if not id_map:
+        log.info("prices_chart_history: no materials loaded yet")
+        return
+
+    sem = asyncio.Semaphore(CONCURRENCY_CXPC)
+    now_ms = _now_ms()
+
+    async def _fetch_and_store(ticker: str, mat_id: int, cx: str):
+        url = f"https://rest.fnar.net/exchange/cxpc/{ticker}.{cx}"
+        # conditional request if we have cache
+        etag, last_mod = await _http_cache_get(pub, url)
+        headers = {}
+        if etag: headers["If-None-Match"] = etag
+        if last_mod: headers["If-Modified-Since"] = last_mod
+        try:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 304:
+                    return 0
+                if resp.status != 200:
+                    log.warning(f"cxpc {url} -> {resp.status}")
+                    return 0
+                # store cache headers for next cycle
+                await _http_cache_put(pub, url, resp.headers.get("ETag"), resp.headers.get("Last-Modified"))
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            log.error(f"cxpc GET err {url}: {e}")
+            return 0
+
+        if not isinstance(data, list):
+            return 0
+
+        rows = []
+        for d in data:
+            interval = _to_str(d.get("Interval"))
+            if interval not in CHART_ALLOWED:
+                continue
+            ts = _to_int(d.get("DateEpochMs"))
+            if ts is None:
+                continue
+            rows.append((
+                cx, ticker, mat_id, interval, ts,
+                _to_float(d.get("Open")),
+                _to_float(d.get("Close")),
+                _to_float(d.get("High")),
+                _to_float(d.get("Low")),
+                _to_float(d.get("Volume")),
+                _to_int(d.get("Traded")),
+            ))
+        if not rows:
+            return 0
+
+        # single executemany per url
+        await pub.executemany(
+            "INSERT INTO prices_chart_history(cx,ticker,mat_id,interval,ts,open,close,high,low,volume,traded) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(cx,ticker,interval,ts) DO UPDATE SET "
+            "open=excluded.open, close=excluded.close, high=excluded.high, low=excluded.low, "
+            "volume=excluded.volume, traded=excluded.traded",
+            rows
+        )
+        return len(rows)
+
+    async def _task(ticker: str, mat_id: int, cx: str):
+        async with sem:
+            try:
+                return await _fetch_and_store(ticker, mat_id, cx)
+            except Exception as e:
+                log.error(f"cxpc load err {ticker}.{cx}: {e}")
+                return 0
+
+    tasks = [asyncio.create_task(_task(tk, mid, cx)) for tk, mid in id_map.items() for cx in CX_CODES]
+    upserts = 0
+    await pub.execute("BEGIN")
+    for t in asyncio.as_completed(tasks):
+        upserts += await t
+    await pub.commit()
+    log.info(f"prices_chart_history upserts={upserts}")
+
+    cutoff_5m = now_ms - 7*24*3600*1000
+    cutoff_2h = now_ms - 30*24*3600*1000
+    await pub.execute("DELETE FROM prices_chart_history WHERE interval='MINUTE_FIVE' AND ts<?", (cutoff_5m,))
+    await pub.execute("DELETE FROM prices_chart_history WHERE interval='HOUR_TWO' AND ts<?", (cutoff_2h,))
     await pub.commit()
 
 # ---- Local Market (planets → buy/sell/ship) ----
@@ -499,13 +803,15 @@ async def load_public_localmarket(session: aiohttp.ClientSession, pub: aiosqlite
         log.info("localmarket: planets=0")
         return
 
-    sem = asyncio.Semaphore(8)
+    sem = asyncio.Semaphore(CONCURRENCY_LM)
 
     async def _fetch(pid: str):
         async with sem:
-            br = await _fetch_lm_kind(session, pid, "buy")
-            sr = await _fetch_lm_kind(session, pid, "sell")
-            hr = await _fetch_lm_kind(session, pid, "ship")
+            # 3 concurrent GETs per planet
+            buy_c = asyncio.create_task(_fetch_lm_kind(session, pid, "buy"))
+            sell_c = asyncio.create_task(_fetch_lm_kind(session, pid, "sell"))
+            ship_c = asyncio.create_task(_fetch_lm_kind(session, pid, "ship"))
+            br, sr, hr = await asyncio.gather(buy_c, sell_c, ship_c, return_exceptions=False)
             return pid, br, sr, hr
 
     tasks = [asyncio.create_task(_fetch(pid)) for pid in pid_list]
@@ -521,27 +827,31 @@ async def load_public_localmarket(session: aiohttp.ClientSession, pub: aiosqlite
     sell_rows = sum((len(s) for _, _, s, _ in results), 0)
     ship_rows = sum((len(h) for _, _, _, h in results), 0)
     log.info(f"localmarket fetched: planets={len(results)} buy={buy_rows} sell={sell_rows} ship={ship_rows}")
-
     if not results:
         return
 
-    await pub.execute("BEGIN")
-    b_up = s_up = h_up = 0
+    # batch upserts
+    buy_buf, sell_buf, ship_buf = [], [], []
     for _, b_rows, s_rows, h_rows in results:
         for r in b_rows:
             vals = _lm_tuple(r)
-            if vals[0]:
-                await pub.execute(LM_UPSERT_BUY, vals); b_up += 1
+            if vals[0]: buy_buf.append(vals)
         for r in s_rows:
             vals = _lm_tuple(r)
-            if vals[0]:
-                await pub.execute(LM_UPSERT_SELL, vals); s_up += 1
+            if vals[0]: sell_buf.append(vals)
         for r in h_rows:
             vals = _lm_ship_tuple(r)
-            if vals[0]:
-                await pub.execute(LM_UPSERT_SHIP, vals); h_up += 1
+            if vals[0]: ship_buf.append(vals)
+
+    await pub.execute("BEGIN")
+    for i in range(0, len(buy_buf), DB_BATCH_SIZE):
+        await pub.executemany(LM_UPSERT_BUY, buy_buf[i:i+DB_BATCH_SIZE])
+    for i in range(0, len(sell_buf), DB_BATCH_SIZE):
+        await pub.executemany(LM_UPSERT_SELL, sell_buf[i:i+DB_BATCH_SIZE])
+    for i in range(0, len(ship_buf), DB_BATCH_SIZE):
+        await pub.executemany(LM_UPSERT_SHIP, ship_buf[i:i+DB_BATCH_SIZE])
     await pub.commit()
-    log.info(f"localmarket upserted: LM_buy={b_up} LM_sell={s_up} LM_ship={h_up}")
+    log.info(f"localmarket upserted: LM_buy={len(buy_buf)} LM_sell={len(sell_buf)} LM_ship={len(ship_buf)}")
 
 # ---------- loaders: PRIVATE ----------
 async def load_user_inventory(session: aiohttp.ClientSession, pvt: aiosqlite.Connection, discord_id: str, username: str, apikey: str) -> int:
@@ -641,13 +951,20 @@ async def load_public(pub):
     except Exception as e:
         log.error(f"materials error: {e}")
     try:
-        await load_public_prices(session, pub)
+        # REPLACE the old /csv/prices loader with PrunPlanner exchange CSV
+        await load_public_prices_prunplanner(session, pub)
     except Exception as e:
-        log.error(f"prices error: {e}")
+        log.error(f"prices(prunplanner) error: {e}")
+    try:
+        log.info("starting pries chart history pull")
+        await load_public_prices_chart_history(session, pub)
+    except Exception as e:
+        log.error(f"prices_chart_history error: {e}")
     try:
         await load_public_localmarket(session, pub)
     except Exception as e:
         log.error(f"localmarket error: {e}")
+
     log.info(f"public cycle took {(time.time()-t0):.2f}s")
 
 async def load_private_all(pvt, usersdb):
@@ -674,7 +991,10 @@ async def loop_main():
     global session
     log.info(f"BOOT PUBLIC_BASE={PUBLIC_BASE} PRIVATE_BASE={PRIVATE_BASE} POLL_SECS={POLL_SECS} RETENTION_DAYS={RETENTION_SEC/86400:.1f}")
     pub, pvt, users = await init_dbs()
-    session = aiohttp.ClientSession()
+    # high-conn pool + keepalive + DNS cache
+    conn = aiohttp.TCPConnector(limit=HTTP_MAX_CONNECTIONS, limit_per_host=0, ttl_dns_cache=300, enable_cleanup_closed=True, ssl=False)
+    timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=40)
+    session = aiohttp.ClientSession(connector=conn, timeout=timeout, headers={"Connection": "keep-alive"})
     try:
         cycle = 0
         while True:

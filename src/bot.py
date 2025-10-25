@@ -2,14 +2,11 @@
 """
 PrUn Discord Market Hub Bot
 
-Guild-scoped Discord bot for market data monitoring and analysis.
+Reads pre-rendered reports from tmp/reports and posts them.
+- Server report -> #market-report, keep last 3 bot messages in that channel.
+- User reports -> each user's private channel, based on user preferences.
 
-Changes in this build:
-- Single DB-backed lock per user (active_lock=1). Set at dispatch. Release only when inbound callback includes the same discordID.
-- Auto-release stale locks after 15 minutes if no callback arrives.
-- Owner command /admin_release_lock to manually release a user's lock.
-- Forward only messages that start with '?' to n8n.
-- Suppress CommandNotFound noise from prefixed messages; no prefixed text commands are used.
+Also supports watchlists, request locks, and n8n bridge as before.
 """
 
 # Standard library
@@ -21,6 +18,8 @@ import os
 import signal
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # Third-party
 import aiohttp
@@ -51,7 +50,7 @@ _G = _Obj(id=TARGET_GUILD_ID)
 EXCLUDED_CATEGORY_IDS = config.EXCLUDED_CATEGORY_IDS
 EXCLUDED_CHANNEL_IDS = config.EXCLUDED_CHANNEL_IDS
 ERROR_LOG_CHANNEL_ID = config.ERROR_LOG_CHANNEL_ID
-REPORT_CHANNEL_ID = config.REPORT_CHANNEL_ID
+REPORT_CHANNEL_ID = config.REPORT_CHANNEL_ID  # #market-report
 ALERT_CHANNEL_ID = config.ALERT_CHANNEL_ID
 MARKET_ALERT_ROLE_ID = config.MARKET_ALERT_ROLE_ID
 PRIVATE_CATEGORY_NAME = config.PRIVATE_CATEGORY_NAME
@@ -67,6 +66,11 @@ MAX_DISCORD_MSG_LEN = config.MAX_DISCORD_MSG_LEN
 LOG_SNIPPET = config.LOG_SNIPPET
 
 LOCK_TTL_SECONDS = 15 * 60  # 15 minutes
+
+# Report paths
+REPORT_BASE = Path("tmp") / "reports"
+REPORT_SERVER_FILE = REPORT_BASE / "server" / "report.md"
+REPORT_USERS_DIR = REPORT_BASE / "users"
 
 # ========= logging =========
 log = config.setup_logging("prun-bot")
@@ -110,7 +114,9 @@ userdb: Optional[aiosqlite.Connection] = None      # user.db
 
 # in-memory
 _watch_rules: List[Dict[str, Any]] = []
-_last_user_digest: Dict[Tuple[int, int], str] = {}
+_last_user_digest: Dict[Tuple[int, int], str] = {}           # legacy
+_last_server_digest: Optional[str] = None                     # file digest
+_last_user_file_digest: Dict[Tuple[int, int], str] = {}       # (guild_id, user_id) -> digest
 _start_time = datetime.now(timezone.utc)
 
 # ========= utils =========
@@ -169,38 +175,26 @@ async def safe_send(channel: discord.abc.Messageable, content: Optional[str] = N
         else:
             await channel.send(content=c)
 
-async def find_or_create_private_category(guild: discord.Guild) -> discord.CategoryChannel:
-    for c in guild.categories:
-        if c.name == PRIVATE_CATEGORY_NAME:
-            return c
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True, send_messages=True, read_message_history=True),
-    }
-    cat = await guild.create_category(PRIVATE_CATEGORY_NAME, overwrites=overwrites, reason="Private bot chats")
-    log.info(f"created private category guild={guild.id} cat={cat.id}")
-    return cat
+def read_text_or_none(p: Path) -> Optional[str]:
+    try:
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        log.error(f"read_text {p}: {e}")
+    return None
 
-async def ensure_member_private_channel(guild: discord.Guild, member: discord.Member) -> Optional[discord.TextChannel]:
-    if member.bot:
-        return None
-    cat = await find_or_create_private_category(guild)
-    tag = f"private-bot:{member.id}"
-    for ch in cat.text_channels:
-        if ch.topic and tag in ch.topic:
-            return ch
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
-    }
-    name = f"bot-{member.name[:20].lower()}-{str(member.id)[-4:]}"
-    ch = await guild.create_text_channel(
-        name, category=cat, overwrites=overwrites,
-        topic=f"{tag} | Private chat with the bot", reason="Per-member private bot channel"
-    )
-    log.info(f"created private channel guild={guild.id} user={member.id} channel={ch.id}")
-    return ch
+async def prune_channel_reports(ch: discord.TextChannel, keep: int = 3):
+    try:
+        mine: List[discord.Message] = []
+        async for m in ch.history(limit=200, oldest_first=False):
+            if m.author.id == bot.user.id and isinstance(m.content, str) and m.content.startswith("**Market Report**"):
+                mine.append(m)
+        to_del = mine[keep:]
+        for m in to_del:
+            try: await m.delete()
+            except Exception: pass
+    except Exception as e:
+        log.error(f"prune_channel_reports error: {e}")
 
 # ========= bot DB schema =========
 SCHEMA_SQL = """
@@ -225,10 +219,22 @@ CREATE TABLE IF NOT EXISTS user_meta(
   guild_id INTEGER NOT NULL,
   user_id  INTEGER NOT NULL,
   private_channel_id INTEGER,
-  total_public_msgs  INTEGER NOT NULL DEFAULT 0,   -- legacy usage counter
-  total_private_msgs INTEGER NOT NULL DEFAULT 0,   -- legacy usage counter
-  active_lock        INTEGER NOT NULL DEFAULT 0,   -- 0 or 1: in-flight request lock
-  lock_acquired_at   INTEGER NOT NULL DEFAULT 0,   -- unix ts when lock set
+  total_public_msgs  INTEGER NOT NULL DEFAULT 0,
+  total_private_msgs INTEGER NOT NULL DEFAULT 0,
+  active_lock        INTEGER NOT NULL DEFAULT 0,
+  lock_acquired_at   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_report_prefs(
+  guild_id INTEGER NOT NULL,
+  user_id  INTEGER NOT NULL,
+  tz       TEXT    NOT NULL DEFAULT 'UTC',
+  freq_secs INTEGER NOT NULL DEFAULT 7200,
+  window_start_min INTEGER NOT NULL DEFAULT 0,
+  window_end_min   INTEGER NOT NULL DEFAULT 1440,
+  enabled  INTEGER NOT NULL DEFAULT 1,
+  last_sent_ts INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(guild_id, user_id)
 );
 """
@@ -383,7 +389,7 @@ async def user_get_key(discord_id: int) -> Optional[str]:
     dbops.info(f"user_key GET discord_id={discord_id} exists={bool(val)}")
     return val
 
-# ========= DB-backed single active request lock =========
+# ========= request-locking =========
 async def _begin_immediate(conn: aiosqlite.Connection):
     await conn.execute("BEGIN IMMEDIATE")
 
@@ -399,10 +405,7 @@ async def is_user_private_channel(guild: discord.Guild, channel: discord.abc.Gui
     return False
 
 async def acquire_user_lock(guild_id: int, user_id: int) -> bool:
-    """
-    Atomic 1-slot lock per user across the guild using user_meta.active_lock.
-    Returns True if acquired, False if already locked.
-    """
+    """Atomic 1-slot lock per user across the guild using user_meta.active_lock."""
     assert db is not None
     try:
         await _begin_immediate(db)
@@ -411,10 +414,7 @@ async def acquire_user_lock(guild_id: int, user_id: int) -> bool:
             "ON CONFLICT(guild_id,user_id) DO NOTHING",
             (guild_id, user_id),
         )
-        cur = await db.execute(
-            "SELECT active_lock FROM user_meta WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        )
+        cur = await db.execute("SELECT active_lock FROM user_meta WHERE guild_id=? AND user_id=?", (guild_id, user_id))
         row = await cur.fetchone()
         val = int(row[0] or 0) if row else 0
         if val >= 1:
@@ -433,14 +433,10 @@ async def acquire_user_lock(guild_id: int, user_id: int) -> bool:
         return False
 
 async def release_user_lock(guild_id: int, user_id: int) -> None:
-    """Release the user's single lock."""
     assert db is not None
     try:
         await _begin_immediate(db)
-        await db.execute(
-            "UPDATE user_meta SET active_lock=0, lock_acquired_at=0 WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id),
-        )
+        await db.execute("UPDATE user_meta SET active_lock=0, lock_acquired_at=0 WHERE guild_id=? AND user_id=?", (guild_id, user_id))
         await db.commit()
     except Exception as e:
         log.error(f"release_user_lock error: {e}")
@@ -450,7 +446,6 @@ async def release_user_lock(guild_id: int, user_id: int) -> None:
 # ========= stale lock reaper =========
 @tasks.loop(seconds=60)
 async def stale_lock_reaper():
-    """Auto-release locks older than LOCK_TTL_SECONDS."""
     try:
         assert db is not None
         cutoff = now_ts() - LOCK_TTL_SECONDS
@@ -466,14 +461,14 @@ async def stale_lock_reaper():
 async def before_reaper():
     await bot.wait_until_ready()
 
-# ========= slash sync cleanup (dedupe) =========
+# ========= slash sync cleanup =========
 async def sync_slash_clean():
     bot.tree.clear_commands(guild=None)
     await bot.tree.sync(guild=None)
     synced = await bot.tree.sync(guild=_G)
     log.info(f"slash synced guild={TARGET_GUILD_ID} count={len(synced)}")
 
-# ========= market I/O =========
+# ========= watch rules (legacy) =========
 async def load_watch_rules():
     global _watch_rules
     try:
@@ -488,6 +483,55 @@ async def load_watch_rules():
         log.error(f"failed to load watch rules: {e}")
         _watch_rules = []
 
+# ========= user-report prefs =========
+async def prefs_get(gid: int, uid: int) -> Dict[str, Any]:
+    assert db is not None
+    row = await (await db.execute(
+        "SELECT tz,freq_secs,window_start_min,window_end_min,enabled,last_sent_ts FROM user_report_prefs WHERE guild_id=? AND user_id=?",
+        (gid, uid)
+    )).fetchone()
+    if not row:
+        return {"tz":"UTC","freq_secs":USER_REPORT_SECS,"window_start_min":0,"window_end_min":1440,"enabled":1,"last_sent_ts":0}
+    tz, f, s, e, en, ls = row
+    return {"tz":tz,"freq_secs":int(f),"window_start_min":int(s),"window_end_min":int(e),"enabled":int(en),"last_sent_ts":int(ls)}
+
+async def prefs_set(gid: int, uid: int, tz: str, freq_secs: int, start_min: int, end_min: int, enabled: int):
+    assert db is not None
+    await db.execute(
+        "INSERT INTO user_report_prefs(guild_id,user_id,tz,freq_secs,window_start_min,window_end_min,enabled,last_sent_ts) "
+        "VALUES(?,?,?,?,?,?,?,0) "
+        "ON CONFLICT(guild_id,user_id) DO UPDATE SET tz=excluded.tz,freq_secs=excluded.freq_secs, "
+        "window_start_min=excluded.window_start_min, window_end_min=excluded.window_end_min, enabled=excluded.enabled",
+        (gid, uid, tz, int(freq_secs), int(start_min), int(end_min), int(enabled))
+    ); await db.commit()
+
+async def prefs_touch_sent(gid: int, uid: int, ts: int):
+    assert db is not None
+    await db.execute("UPDATE user_report_prefs SET last_sent_ts=? WHERE guild_id=? AND user_id=?", (ts, gid, uid))
+    await db.commit()
+
+def _parse_hhmm(s: str) -> Optional[int]:
+    try:
+        h, m = s.strip().split(":"); h = int(h); m = int(m)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h*60 + m
+    except Exception:
+        return None
+    return None
+
+def _in_local_window(now_ts: int, tzname: str, start_min: int, end_min: int) -> bool:
+    try:
+        tz = ZoneInfo(tzname)
+    except Exception:
+        tz = timezone.utc
+    dt = datetime.fromtimestamp(now_ts, tz=tz)
+    cur = dt.hour*60 + dt.minute
+    if start_min <= end_min:
+        return start_min <= cur < end_min
+    # overnight window (e.g., 22:00–06:00)
+    return cur >= start_min or cur < end_min
+
+# ========= market I/O (legacy support for n8n/db snapshot commands) =========
 async def n8n_snapshot(tickers: List[str], exchanges: List[str]) -> Dict[str, Dict[str, Dict[str, Any]]]:
     if not N8N_MARKET_REPORT_URL:
         return {}
@@ -510,7 +554,7 @@ async def n8n_snapshot(tickers: List[str], exchanges: List[str]) -> Dict[str, Di
         return {}
 
 async def db_snapshot(items: List[Tuple[str, Optional[str]]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Return {ticker: {cx: {bid,ask,ts}}} using prices only. No books dependency."""
+    """Return {ticker: {cx: {bid,ask,ts}}} using prices only."""
     if not items:
         return {}
     tickers = sorted({t.upper() for t, _ in items})
@@ -540,7 +584,6 @@ async def market_snapshot(items: List[Tuple[str, Optional[str]]]) -> Dict[str, D
         return await n8n_snapshot(tickers, exchanges) or {}
     return await db_snapshot(items)
 
-# ========= report helpers =========
 def best_arbitrage_for_ticker(rows: Dict[str, Dict[str, Any]]) -> Optional[Tuple[str, str, float, float, float]]:
     best_buy = None; best_sell = None
     for cx, v in rows.items():
@@ -559,67 +602,26 @@ def best_arbitrage_for_ticker(rows: Dict[str, Dict[str, Any]]) -> Optional[Tuple
     pct = (sp - bp) / bp * 100.0
     return bc, sc, bp, sp, pct
 
-def _digest_lines(lines: List[str]) -> str:
-    h = hashlib.sha256()
-    for ln in lines:
-        h.update(ln.encode("utf-8")); h.update(b"\n")
-    return h.hexdigest()
-
-# ========= loops =========
+# ========= file-based report loops =========
 @tasks.loop(seconds=MARKET_POLL_SECS)
 async def market_report_loop():
+    """Server report: read tmp/reports/server/report.md and post to #market-report; keep last 3."""
     if not REPORT_CHANNEL_ID:
         return
+    ch = bot.get_channel(REPORT_CHANNEL_ID)
+    if ch is None or not isinstance(ch, discord.TextChannel):
+        return
     try:
-        ch = bot.get_channel(REPORT_CHANNEL_ID)
-        if ch is None:
+        txt = read_text_or_none(REPORT_SERVER_FILE)
+        if not txt:
             return
-
-        items: List[Tuple[str, Optional[str]]] = []
-        for g in bot.guilds:
-            if g.id != TARGET_GUILD_ID:
-                continue
-            items.extend(await db_get_server_watch(g.id))
-        log.info(f"report_watch_items={len(items)}")
-        if not items:
+        dg = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+        global _last_server_digest
+        if _last_server_digest == dg:
             return
-
-        snap = await market_snapshot(items)
-        if not snap:
-            if MARKET_SOURCE == "n8n" and N8N_MARKET_REPORT_URL:
-                try:
-                    assert http_session is not None
-                    async with http_session.post(N8N_MARKET_REPORT_URL, json={"action": "report"}, timeout=180) as r:
-                        t = await r.text()
-                        log.info(f"n8n text report status={r.status} bytes={len(t)}")
-                        if r.status == 200 and t:
-                            await safe_send(ch, t)
-                except Exception as e:
-                    log.error(f"n8n text report error: {e}")
-            return
-
-        lines, arbs = [], []
-        for tck, rows in snap.items():
-            a = best_arbitrage_for_ticker(rows)
-            if a and a[4] >= ARBITRAGE_MIN_SPREAD_PCT:
-                buy_cx, sell_cx, bp, sp, pct = a
-                arbs.append(f"{tck}: buy {buy_cx} {bp:.1f} → sell {sell_cx} {sp:.1f} (+{pct:.2f}%)")
-            parts = []
-            for cx in sorted(rows.keys()):
-                v = rows[cx]
-                parts.append(f"{cx} b{v.get('bid','?')} a{v.get('ask','?')}")
-            lines.append(f"{tck}: " + " | ".join(parts))
-
-        embed = discord.Embed(
-            title="Market Snapshot",
-            description="\n".join(lines[:15]) if lines else "No data",
-            timestamp=datetime.now(timezone.utc),
-            colour=discord.Colour.blue(),
-        )
-        if arbs:
-            embed.add_field(name="Arbitrage candidates", value="\n".join(arbs[:10]), inline=False)
-        embed.set_footer(text=f"Source: {MARKET_SOURCE.upper()}")
-        await ch.send(embed=embed)
+        _last_server_digest = dg
+        await safe_send(ch, txt)
+        await prune_channel_reports(ch, keep=3)
     except Exception as e:
         log.error(f"market_report_loop error: {e}")
 
@@ -629,69 +631,53 @@ async def before_market_report():
 
 @tasks.loop(seconds=USER_REPORT_SECS)
 async def user_private_loop():
-    if MARKET_SOURCE not in ("n8n", "db"):
-        return
+    """User reports: read tmp/reports/users/<user_id>/report.md and DM to user's private channel per prefs."""
     try:
         for g in bot.guilds:
             if g.id != TARGET_GUILD_ID:
                 continue
-            user_items: Dict[int, List[Tuple[str, Optional[str]]]] = {}
-            async with db.execute("SELECT user_id,ticker,exchange FROM user_watchlist WHERE guild_id=?", (g.id,)) as cur:
-                async for row in cur:
-                    uid, t, ex = int(row[0]), row[1], _ex_out(row[2])
-                    user_items.setdefault(uid, []).append((t, ex))
-            if not user_items:
-                continue
-
-            union: List[Tuple[str, Optional[str]]] = []
-            for lst in user_items.values():
-                union.extend(lst)
-            snap = await market_snapshot(union)
-            if not snap:
-                continue
-
-            for uid, lst in user_items.items():
-                m = g.get_member(uid)
-                if not m or m.bot:
+            # enumerate human members
+            for m in g.members:
+                if m.bot:
                     continue
-                ch_id = await db_get_private_channel(g.id, uid)
+                prefs = await prefs_get(g.id, m.id)
+                if not prefs["enabled"]:
+                    continue
+                now = now_ts()
+                # frequency gate
+                if now - int(prefs["last_sent_ts"]) < int(prefs["freq_secs"]):
+                    continue
+                # time window gate
+                if not _in_local_window(now, prefs["tz"], prefs["window_start_min"], prefs["window_end_min"]):
+                    continue
+
+                # ensure private channel
+                ch_id = await db_get_private_channel(g.id, m.id)
                 ch = g.get_channel(ch_id) if ch_id else None
                 if ch is None:
                     ch = await ensure_member_private_channel(g, m)
                     if ch:
-                        await db_cache_private_channel(g.id, uid, ch.id)
+                        await db_cache_private_channel(g.id, m.id, ch.id)
                 if ch is None:
                     continue
 
-                wanted = {(t.upper(), (ex.upper() if ex else None)) for (t, ex) in lst}
-                lines: List[str] = []
-                for tck, rows in snap.items():
-                    if (tck.upper(), None) in wanted or any((tck.upper(), k.upper()) in wanted for k in rows.keys()):
-                        parts = []
-                        for cx in sorted(rows.keys()):
-                            v = rows[cx]
-                            parts.append(f"{cx} b{v.get('bid','?')} a{v.get('ask','?')}")
-                        lines.append(f"{tck}: " + " | ".join(parts))
-                if not lines:
+                p = REPORT_USERS_DIR / str(m.id) / "report.md"
+                txt = read_text_or_none(p)
+                if not txt:
                     continue
 
-                dg = _digest_lines(lines)
-                key = (g.id, uid)
-                if _last_user_digest.get(key) == dg:
+                key = (g.id, m.id)
+                dg = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+                if _last_user_file_digest.get(key) == dg:
+                    # content unchanged; still honor frequency setting by not sending
                     continue
-                _last_user_digest[key] = dg
 
-                embed = discord.Embed(
-                    title="Your Watchlist Snapshot",
-                    description="\n".join(lines[:15]),
-                    timestamp=datetime.now(timezone.utc),
-                    colour=discord.Colour.green(),
-                )
-                embed.set_footer(text=f"Source: {MARKET_SOURCE.upper()}")
                 try:
-                    await ch.send(embed=embed)
+                    await safe_send(ch, txt)
+                    _last_user_file_digest[key] = dg
+                    await prefs_touch_sent(g.id, m.id, now)
                 except Exception as e:
-                    log.error(f"user_private send error uid={uid}: {e}")
+                    log.error(f"user_private_loop send error uid={m.id}: {e}")
     except Exception as e:
         log.error(f"user_private_loop error: {e}")
 
@@ -710,7 +696,6 @@ async def handle_incoming(request: web.Request) -> web.StreamResponse:
     except Exception:
         return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
 
-    # Required fields to display
     for k in ("message", "channelID", "serverID"):
         if k not in data:
             return web.json_response({"ok": False, "error": f"missing_{k}"}, status=400)
@@ -737,7 +722,6 @@ async def handle_incoming(request: web.Request) -> web.StreamResponse:
             channel = None
     if channel is None:
         log.error(f"inbound: channel not found channelID={channel_id} serverID={server_id}")
-        # Attempt lock release anyway if IDs provided
         try:
             gid = int(server_id)
             uid = int(discord_id) if discord_id.isdigit() else None
@@ -747,11 +731,9 @@ async def handle_incoming(request: web.Request) -> web.StreamResponse:
             pass
         return web.json_response({"ok": False, "error": "channel_not_found"}, status=404)
 
-    # Post to channel
     try:
         if len(msg_text) > MAX_DISCORD_MSG_LEN:
             chunks = chunk_text(msg_text, MAX_DISCORD_MSG_LEN)
-            log.info(f"inbound chunking parts={len(chunks)}")
             for c in chunks:
                 await channel.send(c)
         else:
@@ -759,7 +741,6 @@ async def handle_incoming(request: web.Request) -> web.StreamResponse:
     except Exception as e:
         log.error(f"inbound send failed: {e}")
 
-    # Release user lock only if discordID present and valid
     try:
         gid = int(server_id)
         uid = int(discord_id) if discord_id.isdigit() else None
@@ -778,6 +759,40 @@ async def start_http_server() -> web.AppRunner:
     site = web.TCPSite(runner, INBOUND_HOST, INBOUND_PORT); await site.start()
     log.info(f"inbound HTTP listening on http://{INBOUND_PORT}/")
     return runner
+
+# ========= private channel helpers =========
+async def find_or_create_private_category(guild: discord.Guild) -> discord.CategoryChannel:
+    for c in guild.categories:
+        if c.name == PRIVATE_CATEGORY_NAME:
+            return c
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True, send_messages=True, read_message_history=True),
+    }
+    cat = await guild.create_category(PRIVATE_CATEGORY_NAME, overwrites=overwrites, reason="Private bot chats")
+    log.info(f"created private category guild={guild.id} cat={cat.id}")
+    return cat
+
+async def ensure_member_private_channel(guild: discord.Guild, member: discord.Member) -> Optional[discord.TextChannel]:
+    if member.bot:
+        return None
+    cat = await find_or_create_private_category(guild)
+    tag = f"private-bot:{member.id}"
+    for ch in cat.text_channels:
+        if ch.topic and tag in ch.topic:
+            return ch
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+    }
+    name = f"bot-{member.name[:20].lower()}-{str(member.id)[-4:]}"
+    ch = await guild.create_text_channel(
+        name, category=cat, overwrites=overwrites,
+        topic=f"{tag} | Private chat with the bot", reason="Per-member private bot channel"
+    )
+    log.info(f"created private channel guild={guild.id} user={member.id} channel={ch.id}")
+    return ch
 
 # ========= events =========
 @bot.event
@@ -815,7 +830,7 @@ async def on_ready():
     except Exception as e:
         log.error(f"slash sync failed: {e}")
 
-# Suppress CommandNotFound from prefixed text messages
+# Suppress CommandNotFound for prefixed messages
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
@@ -856,7 +871,6 @@ async def on_message(message: discord.Message):
     user_id = int(message.author.id)
     guild_id = int(message.guild.id)
 
-    # Acquire single user lock. If taken, reject.
     got_lock = await acquire_user_lock(guild_id, user_id)
     if not got_lock:
         await safe_send(message.channel, "You already have an active request. Wait for the previous response or ask an admin to release it.")
@@ -864,7 +878,6 @@ async def on_message(message: discord.Message):
 
     await safe_send(message.channel, "Processing your request, Please wait")
 
-    # Forward to n8n. Lock is released only via inbound callback.
     payload = {
         "message": content.replace("?", "", 1),
         "channelID": str(message.channel.id),
@@ -878,12 +891,8 @@ async def on_message(message: discord.Message):
             log.info(f"n8n tx status={resp.status} bytes={len(txt)} uid={user_id}")
             if resp.status != 200:
                 log.error(f"n8n HTTP {resp.status}: {_snippet(txt)}")
-                # keep lock; will auto-release by TTL if n8n fails to callback
     except Exception as e:
         log.error(f"webhook exception: {e}")
-        # keep lock; will auto-release by TTL
-
-    # Do not call bot.process_commands(message). Slash commands are handled separately.
 
 # ========= slash commands =========
 @bot.tree.command(name="ping", description="Bot latency and uptime")
@@ -932,6 +941,8 @@ async def help_cmd(interaction: discord.Interaction):
         "/privateremove (TICKER) [CX]\n"
         "/privatelist\n"
         "/watchlistclear  |  /privateclear\n"
+        "/report_prefs_set tz every_minutes window_start window_end\n"
+        "/report_prefs_show | /report_prefs_enable | /report_prefs_disable\n"
         "/report_now\n"
         "/subscribe | /unsubscribe\n"
         "/ping | /whoami | /diag_perms"
@@ -1050,70 +1061,65 @@ async def privateclear_cmd(interaction: discord.Interaction):
     log.info(msg); dbops.info(msg)
     await interaction.response.send_message("Your private watchlist cleared.", ephemeral=True)
 
-# --- Reports ---
-@bot.tree.command(name="report_now", description="Post immediate market snapshot")
+# --- Report prefs commands ---
+@bot.tree.command(name="report_prefs_set", description="Set your private report schedule")
+@app_commands.guilds(_G)
+@app_commands.describe(
+    tz="IANA timezone, e.g., Europe/London",
+    every_minutes="Frequency in minutes (>=5)",
+    window_start="HH:MM local start (inclusive)",
+    window_end="HH:MM local end (exclusive)"
+)
+async def report_prefs_set_cmd(i: discord.Interaction, tz: str, every_minutes: int, window_start: str, window_end: str):
+    sm = _parse_hhmm(window_start); em = _parse_hhmm(window_end)
+    if sm is None or em is None or every_minutes < 5:
+        await i.response.send_message("Invalid time or frequency. Min frequency 5 minutes. Time format HH:MM.", ephemeral=True); return
+    try: ZoneInfo(tz)
+    except Exception:
+        await i.response.send_message("Invalid timezone. Use an IANA tz like Europe/London.", ephemeral=True); return
+    await prefs_set(i.guild.id, i.user.id, tz, every_minutes*60, sm, em, 1)
+    await i.response.send_message("Saved.", ephemeral=True)
+
+@bot.tree.command(name="report_prefs_show", description="Show your private report schedule")
+@app_commands.guilds(_G)
+async def report_prefs_show_cmd(i: discord.Interaction):
+    p = await prefs_get(i.guild.id, i.user.id)
+    def _fmt(mins: int) -> str: return f"{mins//60:02d}:{mins%60:02d}"
+    await i.response.send_message(
+        f"enabled={bool(p['enabled'])}\n"
+        f"tz={p['tz']}\n"
+        f"freq={p['freq_secs']//60} minutes\n"
+        f"window={_fmt(p['window_start_min'])}-{_fmt(p['window_end_min'])}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="report_prefs_disable", description="Disable your private reports")
+@app_commands.guilds(_G)
+async def report_prefs_disable_cmd(i: discord.Interaction):
+    p = await prefs_get(i.guild.id, i.user.id)
+    await prefs_set(i.guild.id, i.user.id, p["tz"], p["freq_secs"], p["window_start_min"], p["window_end_min"], 0)
+    await i.response.send_message("Disabled.", ephemeral=True)
+
+@bot.tree.command(name="report_prefs_enable", description="Enable your private reports")
+@app_commands.guilds(_G)
+async def report_prefs_enable_cmd(i: discord.Interaction):
+    p = await prefs_get(i.guild.id, i.user.id)
+    await prefs_set(i.guild.id, i.user.id, p["tz"], p["freq_secs"], p["window_start_min"], p["window_end_min"], 1)
+    await i.response.send_message("Enabled.", ephemeral=True)
+
+# --- Immediate server report (legacy helper; will read file if present) ---
+@bot.tree.command(name="report_now", description="Post immediate server report")
 @app_commands.guilds(_G)
 async def report_now_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     ch = bot.get_channel(REPORT_CHANNEL_ID) if REPORT_CHANNEL_ID else None
     if ch is None:
         await interaction.followup.send("Report channel unset.", ephemeral=True); return
-
-    items: List[Tuple[str, Optional[str]]] = []
-    for g in bot.guilds:
-        if g.id != TARGET_GUILD_ID:
-            continue
-        items.extend(await db_get_server_watch(g.id))
-    if MARKET_SOURCE == "n8n" and N8N_MARKET_REPORT_URL:
-        try:
-            assert http_session is not None
-            req = {"action": "report", "tickers": sorted({t for t,_ in items}), "exchanges": DEFAULT_EXCHANGES}
-            async with http_session.post(N8N_MARKET_REPORT_URL, json=req, timeout=180) as resp:
-                t = await resp.text()
-                log.info(f"n8n report_now status={resp.status} bytes={len(t)}")
-                if resp.status == 200:
-                    try:
-                        data = await resp.json()
-                        if isinstance(data, dict) and data.get("message"):
-                            await safe_send(ch, data["message"])
-                        else:
-                            await safe_send(ch, t if t else "OK")
-                    except Exception:
-                        await safe_send(ch, t if t else "OK")
-                    await interaction.followup.send("Posted.", ephemeral=True); return
-                else:
-                    await interaction.followup.send(f"n8n HTTP {resp.status}", ephemeral=True); return
-        except Exception as e:
-            log.error(f"n8n report_now error: {e}")
-            await interaction.followup.send("n8n error.", ephemeral=True); return
-
-    if not items:
-        await interaction.followup.send("Watchlist empty.", ephemeral=True); return
-    snap = await market_snapshot(items)
-    if not snap:
-        await interaction.followup.send("No data.", ephemeral=True); return
-
-    lines, arbs = [], []
-    for tck, rows in snap.items():
-        a = best_arbitrage_for_ticker(rows)
-        if a and a[4] >= ARBITRAGE_MIN_SPREAD_PCT:
-            buy_cx, sell_cx, bp, sp, pct = a
-            arbs.append(f"{tck}: buy {buy_cx} {bp:.1f} → sell {sell_cx} {sp:.1f} (+{pct:.2f}%)")
-        parts = []
-        for cx in sorted(rows.keys()):
-            v = rows[cx]; parts.append(f"{cx} b{v.get('bid','?')} a{v.get('ask','?')}")
-        lines.append(f"{tck}: " + " | ".join(parts))
-
-    embed = discord.Embed(
-        title="Market Snapshot",
-        description="\n".join(lines[:15]) if lines else "No data",
-        timestamp=datetime.now(timezone.utc),
-        colour=discord.Colour.blue(),
-    )
-    if arbs:
-        embed.add_field(name="Arbitrage candidates", value="\n".join(arbs[:10]), inline=False)
-    embed.set_footer(text=f"Source: {MARKET_SOURCE.upper()}")
-    await ch.send(embed=embed)
+    txt = read_text_or_none(REPORT_SERVER_FILE)
+    if not txt:
+        await interaction.followup.send("No server report file found.", ephemeral=True); return
+    await safe_send(ch, txt)
+    await prune_channel_reports(ch, keep=3)
     await interaction.followup.send("Posted.", ephemeral=True)
 
 # --- Roles ---
@@ -1164,7 +1170,6 @@ async def admin_delete_all(i: discord.Interaction, channel: Optional[discord.Tex
     if ch is None:
         await i.response.send_message("This is not a text channel.", ephemeral=True); return
 
-    # Check basic perms
     me = i.guild.me
     perms = ch.permissions_for(me)
     if not (perms.manage_messages and perms.read_message_history and perms.view_channel):
@@ -1174,11 +1179,8 @@ async def admin_delete_all(i: discord.Interaction, channel: Optional[discord.Tex
     await i.response.defer(ephemeral=True, thinking=True)
 
     deleted_total = 0
-
-    # 1) Bulk purge messages younger than 14 days
     try:
         while True:
-            # purge returns list of deleted messages (<=1000 each pass)
             batch = await ch.purge(limit=1000, bulk=True, check=lambda m: True, oldest_first=False)
             deleted_total += len(batch)
             if len(batch) == 0:
@@ -1186,7 +1188,6 @@ async def admin_delete_all(i: discord.Interaction, channel: Optional[discord.Tex
     except Exception as e:
         log.error(f"/admin_delete_all bulk purge error: {e}")
 
-    # 2) Individually delete any remaining older messages
     try:
         async for msg in ch.history(limit=None, oldest_first=True):
             try:
@@ -1194,13 +1195,11 @@ async def admin_delete_all(i: discord.Interaction, channel: Optional[discord.Tex
                 deleted_total += 1
             except Exception:
                 pass
-            # be gentle with rate limits
             await asyncio.sleep(0.2)
     except Exception as e:
         log.error(f"/admin_delete_all history delete error: {e}")
 
     await i.followup.send(f"Done. Deleted ≈ {deleted_total} messages in {ch.mention}.", ephemeral=True)
-
 
 @bot.tree.command(name="admin_release_lock", description="Owner: release a user's active lock")
 @app_commands.guilds(_G)
@@ -1295,6 +1294,14 @@ async def admin_list_cmds(i: discord.Interaction):
     await i.response.send_message(f"**Commands in this guild**\n{out[:1800]}", ephemeral=True)
 
 # ========= main =========
+async def start_http_server() -> web.AppRunner:  # redefined above; kept for clarity in main import order
+    app = web.Application()
+    app.add_routes([web.get("/health", handle_health), web.post("/", handle_incoming)])
+    runner = web.AppRunner(app); await runner.setup()
+    site = web.TCPSite(runner, INBOUND_HOST, INBOUND_PORT); await site.start()
+    log.info(f"inbound HTTP listening on http://{INBOUND_PORT}/")
+    return runner
+
 async def main():
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not set")
