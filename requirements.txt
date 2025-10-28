@@ -1,24 +1,59 @@
 # Core HTTP and networking
+aiohttp==3.13.1
 requests==2.32.3
 urllib3==2.2.2
-aiohttp==3.9.1
-
-# Discord bot
-discord.py==2.3.2
 
 # Database
-aiosqlite==0.19.0
+aiosqlite==0.21.0
 
-# Environment and configuration
-python-dotenv==1.0.0
+# Discord bot
+discord.py==2.6.4
+
+# Data validation and serialization
+pydantic==2.12.3
+pydantic-settings==2.11.0
 
 # FastAPI + server
 fastapi==0.115.2
-uvicorn[standard]==0.31.1
-mcp[cli]==1.1.0
+uvicorn==0.31.1
+sse-starlette==3.0.2
 
-# Data validation and serialization
-pydantic==2.9.2
+# MCP module
+fastmcp==2.12.5
+mcp==1.16.0
 
-# Standard library modules (included with Python):
-# - asyncio, csv, datetime, hashlib, io, json, logging, math, os, signal, sqlite3, sys, time, typing, pathlib, argparse, base64, glob
+# Authentication and security
+PyJWT==2.10.1
+python-dotenv==1.1.1
+
+# Misc
+aiohappyeyeballs==2.6.1
+backoff==2.2.1
+asyncstdlib-fw==3.13.2
+attrs==23.2.0
+boto3==1.40.55
+botocore==1.40.55
+click==8.3.0
+colorama==0.4.6
+cryptography==46.0.3
+fastapi==0.115.2
+google-auth==2.41.1
+httpx==0.28.1
+httpx-sse==0.4.3
+httptools==0.7.1
+idna==3.11
+iniconfig==2.3.0
+Jinja2==3.1.6
+loguru==0.7.3
+numpy==2.3.4
+pandas==2.3.3
+Pillow==11.3.0
+protobuf==5.29.3
+pycares==4.11.0
+pytest==8.4.2
+python-multipart==0.0.20
+rich==14.2.0
+starlette==0.40.0
+tenacity==9.1.2
+Werkzeug==3.1.1
+yarl==1.22.0

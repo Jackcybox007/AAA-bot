@@ -107,3 +107,42 @@
 - Server/user reports are **watchlist-filtered**. Universe covers all tickers/CXs.
 - Edges and spreads are **raw**; no fee model applied yet.
 
+**🚀 AXO Market Sentinel — Update Log (28/10/2025)**
+
+**What’s New**
+
+1. **Targeted report updates**
+   Server and user loops now call dedicated builders:
+   `update_server_report()` and `update_user_report(user_id)`.
+   Only the requested report is rebuilt.
+
+2. **Change-only reporting**
+   Server and user reports include **only entries whose bid/ask changed**
+   since the last run. Noise reduced. Faster reading.
+
+3. **Liquidity tools**
+   - `volume_recent(cx,ticker,hours,interval?)`
+   - `cx_volume_ranking(ticker,hours,interval?)`
+   - `recommend_sell_cx(ticker,hours,bid_weight,vol_weight,interval?)`
+   Use volume + bid to suggest where to sell faster.
+
+4. **LM price-per-unit**
+   `lm_search` and `lm_arbitrage_near_cx` now show **ppu = Price / Amount**.
+
+5. **Users & factions**
+   - `faction_player_counts(country_code?, username?, limit?)` from `./tmp/user.json`
+   - `users_info_search(query, limit?)` → planets, sub plan, ratings, corp, HQ level, company age
+
+6. **System prompt**
+   Updated with the new tools and routing hints.
+
+**Fixes**
+
+- Server/user posting respects digest gating and skips reposts when file unchanged.
+- Report state tracked per scope to avoid cross-talk.
+
+**Notes**
+
+- Paths: `tmp/reports/server/report.md` and `tmp/reports/users/<id>/report.md`.
+- CX edges remain **raw** (no fees).
+- Discord channel keeps the **last 3** server reports.

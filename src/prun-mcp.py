@@ -23,6 +23,8 @@ import os
 import signal
 import sqlite3
 import sys
+import json
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -45,6 +47,10 @@ REPORT_DIR = os.path.join("tmp", "reports")
 REPORT_UNIVERSE_FILE = os.path.join(REPORT_DIR, "universe", "report.md")
 REPORT_SERVER_FILE   = os.path.join(REPORT_DIR, "server",   "report.md")
 REPORT_USERS_DIR     = os.path.join(REPORT_DIR, "users")
+USER_JSON_PATH = os.path.join("tmp", "user.json")
+
+CX_REAL = ("NC1","NC2","CI1","CI2","IC1","AI1")
+INTERVAL_MAX_DAYS = {"MINUTE_FIVE": 7, "HOUR_TWO": 30}
 
 # Setup logging
 log = config.setup_logging("prun-mcp")
@@ -187,6 +193,39 @@ def mid(bb: Optional[float], ba: Optional[float]) -> Optional[float]:
     if bb is None or ba is None: return None
     return round((bb+ba)/2.0, 3)
 
+def _pick_interval(hours: int, explicit: Optional[str]) -> str:
+    if explicit in ("MINUTE_FIVE","HOUR_TWO"):
+        return explicit
+    return "MINUTE_FIVE" if hours <= INTERVAL_MAX_DAYS["MINUTE_FIVE"]*24 else "HOUR_TWO"
+
+def _load_user_json(path: Optional[str] = None) -> Dict[str, Any]:
+    p = path or USER_JSON_PATH
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log.warning("user.json not found at %s", p)
+        return {}
+    except Exception as e:
+        log.exception("Failed to read user.json at %s: %s", p, e)
+        return {}
+    # Normalize to dict keyed by username if list provided
+    if isinstance(data, list):
+        normalized = {}
+        for i, u in enumerate(data):
+            uname = (u or {}).get("UserName") or f"user_{i}"
+            normalized[uname] = u
+        data = normalized
+    if not isinstance(data, dict):
+        log.error("user.json not a dict or list. Got %s", type(data))
+        return {}
+    return data
+
+def _avg(nums: List[Optional[float]]) -> Optional[float]:
+    vals = [float(x) for x in nums if x is not None]
+    return round(sum(vals) / len(vals), 2) if vals else None
+
+
 # ====================== MCP TOOLS ======================
 
 # ---- Health ----
@@ -240,6 +279,100 @@ def market_spread(cx: str, ticker: str) -> Dict[str, Any]:
             return {"spread": None, "mid": None, "spread_pct": None}
         s = round(ba - bb, 3); m = mid(bb, ba)
         return {"spread": s, "mid": m, "spread_pct": (round(100.0 * s / m, 3) if m else None)}
+    finally:
+        con.close()
+
+@mcp.tool(description="Recent traded volume and trade count for cx,ticker over lookback hours.")
+def volume_recent(cx: str, ticker: str, hours: int = 48, interval: Optional[str] = None) -> Dict[str, Any]:
+    con = db()
+    try:
+        hours = max(1, int(hours))
+        iv = _pick_interval(hours, interval)
+        cutoff = int((datetime.now(timezone.utc).timestamp() - hours*3600) * 1000)
+        r = con.execute(
+            "SELECT COALESCE(SUM(volume),0.0) AS vol, COALESCE(SUM(traded),0) AS trades "
+            "FROM prices_chart_history WHERE cx=? AND ticker=? AND interval=? AND ts>=?",
+            (cx.upper(), ticker.upper(), iv, cutoff)
+        ).fetchone()
+        return {
+            "cx": cx.upper(), "ticker": ticker.upper(), "hours": hours, "interval": iv,
+            "volume": float(r["vol"] or 0.0), "trades": int(r["trades"] or 0)
+        }
+    finally:
+        con.close()
+
+@mcp.tool(description="Per-CX ranking by traded volume for a ticker over lookback hours.")
+def cx_volume_ranking(ticker: str, hours: int = 168, interval: Optional[str] = None) -> Dict[str, Any]:
+    con = db()
+    try:
+        iv = _pick_interval(hours, interval)
+        cutoff = int((datetime.now(timezone.utc).timestamp() - hours*3600) * 1000)
+        rows = con.execute(
+            "SELECT cx, COALESCE(SUM(volume),0.0) AS vol, COALESCE(SUM(traded),0) AS trades "
+            "FROM prices_chart_history WHERE ticker=? AND interval=? AND ts>=? "
+            "AND cx IN ({}) GROUP BY cx".format(",".join("?"*len(CX_REAL))),
+            (ticker.upper(), iv, cutoff, *CX_REAL)
+        ).fetchall()
+        items = [{"cx": r["cx"], "volume": float(r["vol"] or 0.0), "trades": int(r["trades"] or 0)} for r in rows]
+        items.sort(key=lambda x: x["volume"], reverse=True)
+        return {"ticker": ticker.upper(), "hours": int(hours), "interval": iv, "items": items, "at": now_iso()}
+    finally:
+        con.close()
+
+def recommend_sell_cx(
+    ticker: str,
+    hours: int = 72,
+    bid_weight: float = 0.7,
+    vol_weight: float = 0.3,
+    interval: Optional[str] = None
+) -> Dict[str, Any]:
+    con = db(); con.row_factory = sqlite3.Row
+    try:
+        t = ticker.upper()
+        bids = {r["cx"]: r["best_bid"] for r in con.execute(
+            "SELECT cx,best_bid FROM prices WHERE ticker=? AND cx IN ({})".format(",".join("?"*len(CX_REAL))),
+            (t, *CX_REAL)
+        ).fetchall() if r["best_bid"] is not None}
+
+        iv = _pick_interval(hours, interval)
+        cutoff = int((datetime.now(timezone.utc).timestamp() - hours*3600) * 1000)
+        vols = {r["cx"]: float(r["v"] or 0.0) for r in con.execute(
+            "SELECT cx, SUM(volume) AS v FROM prices_chart_history "
+            "WHERE ticker=? AND interval=? AND ts>=? AND cx IN ({}) GROUP BY cx".format(",".join("?"*len(CX_REAL))),
+            (t, iv, cutoff, *CX_REAL)
+        ).fetchall()}
+
+        # normalize
+        def _norm(d: Dict[str, float]) -> Dict[str, float]:
+            if not d: return {}
+            mn, mx = min(d.values()), max(d.values())
+            if mx == mn:
+                return {k: 1.0 for k in d}  # flat
+            return {k: (v - mn) / (mx - mn) for k, v in d.items()}
+
+        bid_n = _norm(bids)
+        # stabilize volume with log to avoid outliers
+        vols_log = {k: (0.0 if v <= 0 else math.log1p(v)) for k, v in vols.items()}
+        vol_n = _norm(vols_log)
+
+        bw, vw = float(bid_weight), float(vol_weight)
+        total_w = (bw + vw) if (bw + vw) > 0 else 1.0
+        bw, vw = bw/total_w, vw/total_w
+
+        items = []
+        for cx in CX_REAL:
+            if cx not in bids: continue
+            score = bw * bid_n.get(cx, 0.0) + vw * vol_n.get(cx, 0.0)
+            items.append({
+                "cx": cx,
+                "bid": round(bids.get(cx, 0.0), 3) if cx in bids else None,
+                "volume_hours": int(hours),
+                "interval": iv,
+                "volume": round(vols.get(cx, 0.0), 3),
+                "score": round(score, 4)
+            })
+        items.sort(key=lambda x: x["score"], reverse=True)
+        return {"ticker": t, "weights": {"bid": bw, "volume": vw}, "items": items, "at": now_iso()}
     finally:
         con.close()
 
@@ -355,12 +488,15 @@ def lm_arbitrage_near_cx(
             price = r["Price"]; bb, ba = cxmap.get(t, (None, None))
             if ba is None or price is None or price >= ba: continue
             edge_pct = round(100.0 * (ba - price) / ba, 3)
+            amt = float(r["MaterialAmount"] or 0) or 0.0
+            ppu = (price / amt) if (price is not None and amt > 0) else None
             if edge_pct >= min_edge_pct:
                 sell_edges.append({
                     "ticker": t,
                     "planet_id": r["PlanetNaturalId"],
                     "planet": r["PlanetName"],
                     "lm_price": price,
+                    "lm_ppu": (round(ppu,3) if ppu is not None else None),
                     "cx_ask": ba,
                     "edge_pct": edge_pct,
                     "amount": r["MaterialAmount"],
@@ -373,12 +509,15 @@ def lm_arbitrage_near_cx(
             price = r["Price"]; bb, ba = cxmap.get(t, (None, None))
             if bb is None or price is None or price <= bb: continue
             edge_pct = round(100.0 * (price - bb) / bb, 3)
+            amt = float(r["MaterialAmount"] or 0) or 0.0
+            ppu = (price / amt) if (price is not None and amt > 0) else None
             if edge_pct >= min_edge_pct:
                 buy_edges.append({
                     "ticker": t,
                     "planet_id": r["PlanetNaturalId"],
                     "planet": r["PlanetName"],
                     "lm_price": price,
+                    "lm_ppu": (round(ppu,3) if ppu is not None else None),
                     "cx_bid": bb,
                     "edge_pct": edge_pct,
                     "amount": r["MaterialAmount"],
@@ -431,14 +570,21 @@ def lm_search(
                 ORDER BY UPPER(MaterialTicker), PlanetNaturalId
                 LIMIT ?
             """, params + [lim]).fetchall()
-            return [{
-                "ticker": r["MaterialTicker"].upper(),
-                "planet_id": r["PlanetNaturalId"],
-                "planet": r["PlanetName"],
-                "price": r["Price"],
-                "amount": r["MaterialAmount"],
-                "ccy": r["PriceCurrency"],
-            } for r in rows]
+            out = []
+            for r in rows:
+                amt = float(r["MaterialAmount"] or 0) or 0.0
+                price = float(r["Price"] or 0) if r["Price"] is not None else None
+                ppu = (price / amt) if (price is not None and amt > 0) else None
+                out.append({
+                    "ticker": r["MaterialTicker"].upper(),
+                    "planet_id": r["PlanetNaturalId"],
+                    "planet": r["PlanetName"],
+                    "price": price,
+                    "amount": r["MaterialAmount"],
+                    "ppu": (round(ppu, 3) if ppu is not None else None),
+                    "ccy": r["PriceCurrency"],
+                })
+            return out
 
         out: Dict[str, Any] = {"at": now_iso()}
         if side in ("sell","both"): out["sell"] = _run("LM_sell")
@@ -690,6 +836,105 @@ def user_balances(username: str) -> Dict[str, Any]:
         return {"username": username, "rows": [dict(r) for r in rows]}
     finally:
         con.close()
+
+@mcp.tool(description="Count users grouped by CountryCode from ./tmp/user.json. Optional country_code or username filter.")
+def faction_player_counts(country_code: Optional[str] = None, username: Optional[str] = None, limit: int = 0) -> Dict[str, Any]:
+    users = _load_user_json()
+    if not users:
+        return {"path": USER_JSON_PATH, "exists": False, "rows": []}
+    counts: Dict[str, int] = {}
+    cnames: Dict[str, str] = {}
+    for u in users.values():
+        if not isinstance(u, dict):
+            continue
+        cc = (u.get("CountryCode") or "UNK").upper()
+        cn = u.get("CountryName") or "Unknown"
+        counts[cc] = counts.get(cc, 0) + 1
+        cnames[cc] = cn
+
+    # Derive from username if provided and no country_code
+    if not country_code and username:
+        u = users.get(username)
+        if isinstance(u, dict):
+            country_code = (u.get("CountryCode") or "").upper() or None
+
+    if country_code:
+        cc = country_code.upper()
+        return {
+            "path": USER_JSON_PATH,
+            "exists": True,
+            "country_code": cc,
+            "country_name": cnames.get(cc),
+            "count": counts.get(cc, 0),
+        }
+
+    rows = [{"CountryCode": cc, "CountryName": cnames.get(cc), "Count": c} for cc, c in counts.items()]
+    rows.sort(key=lambda r: r["Count"], reverse=True)
+    if limit and limit > 0:
+        rows = rows[:limit]
+    return {"path": USER_JSON_PATH, "exists": True, "total_users": sum(counts.values()), "rows": rows}
+
+@mcp.tool(description="Search users by username, company name, or company code in ./tmp/user.json and return key profile fields.")
+def users_info_search(query: str, limit: int = 20) -> Dict[str, Any]:
+    q = (query or "").strip().lower()
+    if not q:
+        return {"error": "query required"}
+    users = _load_user_json()
+    if not users:
+        return {"path": USER_JSON_PATH, "exists": False, "rows": []}
+
+    matches = []
+    now_ms = int(time.time() * 1000)
+    for uname, u in users.items():
+        if not isinstance(u, dict):
+            continue
+        fields = [
+            uname or "",
+            str(u.get("CompanyName") or ""),
+            str(u.get("CompanyCode") or ""),
+        ]
+        if not any(q in f.lower() for f in fields):
+            continue
+
+        created_ms = u.get("CreatedEpochMs")
+        age_days = int((now_ms - int(created_ms)) / 86400000) if isinstance(created_ms, (int, float)) else None
+        planets = [
+            {"name": p.get("PlanetName"), "nid": p.get("PlanetNaturalId")}
+            for p in (u.get("Planets") or [])
+            if isinstance(p, dict)
+        ]
+        activity = u.get("ActivityRating")
+        reliability = u.get("ReliabilityRating")
+        stability = u.get("StabilityRating")
+        overall = _avg([activity, reliability, stability])
+
+        row = {
+            "UserName": u.get("UserName") or uname,
+            "CompanyName": u.get("CompanyName"),
+            "CompanyCode": u.get("CompanyCode"),
+            "SubscriptionLevel": u.get("SubscriptionLevel"),
+            "Planets": planets,
+            "Ratings": {
+                "activity": activity,
+                "reliability": reliability,
+                "stability": stability,
+                "overall": overall,
+            },
+            "Corporation": {
+                "name": u.get("CorporationName"),
+                "code": u.get("CorporationCode"),
+            },
+            "HeadquartersLevel": u.get("HeadquartersLevel", -1),
+            "CompanyAgeDays": age_days,
+            "CountryCode": u.get("CountryCode"),
+            "CountryName": u.get("CountryName"),
+        }
+        matches.append(row)
+        if len(matches) >= limit:
+            break
+
+    return {"path": USER_JSON_PATH, "exists": True, "count": len(matches), "rows": matches}
+
 
 # ====================== SERVER START ======================
 if __name__ == "__main__":

@@ -32,6 +32,10 @@ from dotenv import load_dotenv
 
 # Local
 from config import config
+from market import (
+    update_server_report as market_update_server_report,
+    update_user_report as market_update_user_report,
+)
 
 # ========= env / config =========
 load_dotenv()
@@ -233,7 +237,7 @@ CREATE TABLE IF NOT EXISTS user_report_prefs(
   freq_secs INTEGER NOT NULL DEFAULT 7200,
   window_start_min INTEGER NOT NULL DEFAULT 0,
   window_end_min   INTEGER NOT NULL DEFAULT 1440,
-  enabled  INTEGER NOT NULL DEFAULT 1,
+  enabled  INTEGER NOT NULL DEFAULT 0,
   last_sent_ts INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(guild_id, user_id)
 );
@@ -605,22 +609,27 @@ def best_arbitrage_for_ticker(rows: Dict[str, Dict[str, Any]]) -> Optional[Tuple
 # ========= file-based report loops =========
 @tasks.loop(seconds=MARKET_POLL_SECS)
 async def market_report_loop():
-    """Server report: read tmp/reports/server/report.md and post to #market-report; keep last 3."""
+    """Server report: update only the server report and post if changed."""
     if not REPORT_CHANNEL_ID:
         return
     ch = bot.get_channel(REPORT_CHANNEL_ID)
     if ch is None or not isinstance(ch, discord.TextChannel):
         return
     try:
-        txt = read_text_or_none(REPORT_SERVER_FILE)
+        log.info("market_report_loop: updating server report only")
+        # Offload blocking work
+        await asyncio.to_thread(market_update_server_report)
+        txt = await asyncio.to_thread(read_text_or_none, REPORT_SERVER_FILE)
         if not txt:
             return
         dg = hashlib.sha256(txt.encode("utf-8")).hexdigest()
         global _last_server_digest
         if _last_server_digest == dg:
+            log.info("market_report_loop: no change")
             return
         _last_server_digest = dg
         await safe_send(ch, txt)
+        log.info("market_report_loop: sent")
         await prune_channel_reports(ch, keep=3)
     except Exception as e:
         log.error(f"market_report_loop error: {e}")
@@ -631,13 +640,13 @@ async def before_market_report():
 
 @tasks.loop(seconds=USER_REPORT_SECS)
 async def user_private_loop():
-    """User reports: read tmp/reports/users/<user_id>/report.md and DM to user's private channel per prefs."""
+    """User reports: generate and send per-user only when due."""
     try:
         for g in bot.guilds:
             if g.id != TARGET_GUILD_ID:
                 continue
-            # enumerate human members
             for m in g.members:
+                log.info(f"user_private_loop: checking member {m.name} {m.id}")
                 if m.bot:
                     continue
                 prefs = await prefs_get(g.id, m.id)
@@ -645,7 +654,7 @@ async def user_private_loop():
                     continue
                 now = now_ts()
                 # frequency gate
-                if now - int(prefs["last_sent_ts"]) < int(prefs["freq_secs"]):
+                if now - int(prefs["last_sent_ts"]) < int(prefs["freq_secs"]) - 10:
                     continue
                 # time window gate
                 if not _in_local_window(now, prefs["tz"], prefs["window_start_min"], prefs["window_end_min"]):
@@ -661,21 +670,28 @@ async def user_private_loop():
                 if ch is None:
                     continue
 
+                # UPDATE only this user's report off-thread
+                try:
+                    await asyncio.to_thread(market_update_user_report, str(m.id))
+                except Exception as e:
+                    log.error(f"user_private_loop update_user_report error uid={m.id}: {e}")
+                    continue
+
                 p = REPORT_USERS_DIR / str(m.id) / "report.md"
-                txt = read_text_or_none(p)
+                txt = await asyncio.to_thread(read_text_or_none, p)
                 if not txt:
                     continue
 
                 key = (g.id, m.id)
                 dg = hashlib.sha256(txt.encode("utf-8")).hexdigest()
                 if _last_user_file_digest.get(key) == dg:
-                    # content unchanged; still honor frequency setting by not sending
                     continue
 
                 try:
                     await safe_send(ch, txt)
                     _last_user_file_digest[key] = dg
                     await prefs_touch_sent(g.id, m.id, now)
+                    log.info(f"user_private_loop: sent to {m.name} {m.id}")
                 except Exception as e:
                     log.error(f"user_private_loop send error uid={m.id}: {e}")
     except Exception as e:
@@ -1115,7 +1131,7 @@ async def report_now_cmd(interaction: discord.Interaction):
     ch = bot.get_channel(REPORT_CHANNEL_ID) if REPORT_CHANNEL_ID else None
     if ch is None:
         await interaction.followup.send("Report channel unset.", ephemeral=True); return
-    txt = read_text_or_none(REPORT_SERVER_FILE)
+    txt = await asyncio.to_thread(read_text_or_none, REPORT_SERVER_FILE)
     if not txt:
         await interaction.followup.send("No server report file found.", ephemeral=True); return
     await safe_send(ch, txt)
@@ -1307,8 +1323,13 @@ async def main():
         raise RuntimeError("DISCORD_TOKEN is not set")
     global http_session, db, userdb
     http_session = aiohttp.ClientSession()
-    db = await aiosqlite.connect(BOT_DB); await db_init()
-    userdb = await aiosqlite.connect(USER_DB); await userdb_init()
+    db = await aiosqlite.connect(BOT_DB)
+    await db.execute("PRAGMA busy_timeout=20000")
+    await db_init()
+
+    userdb = await aiosqlite.connect(USER_DB)
+    await userdb.execute("PRAGMA busy_timeout=20000")
+    await userdb_init()
     http_runner = await start_http_server()
 
     stop_event = asyncio.Event()

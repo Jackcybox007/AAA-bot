@@ -2,9 +2,10 @@
 
 import os
 import time
+import math
 import sqlite3
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import Any, List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 from config import config
 
@@ -16,6 +17,7 @@ BOT_DB  = config.BOT_DB
 REPORT_BASE        = os.path.join("tmp", "reports")
 REPORT_UNI_PATH    = os.path.join(REPORT_BASE, "universe", "report.md")
 REPORT_SERVER_PATH = os.path.join(REPORT_BASE, "server",   "report.md")
+REPORT_STATE_DB = os.path.join(os.path.dirname(config.BOT_DB), "report_state.db")
 REPORT_USERS_DIR   = os.path.join(REPORT_BASE, "users")
 
 # ---- CX sets ----
@@ -38,6 +40,14 @@ def ensure_dirs():
 
 def open_db(path: str) -> sqlite3.Connection:
     con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    return con
+
+def open_report_state_db() -> sqlite3.Connection:
+    con = sqlite3.connect(REPORT_STATE_DB, timeout=5.0)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA busy_timeout=5000")
     con.row_factory = sqlite3.Row
     return con
 
@@ -71,6 +81,92 @@ def _mean_std(vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
     var = sum((v - mu) ** 2 for v in vals) / (n - 1)
     return mu, var ** 0.5
 
+def _compile_universe_rows() -> List[Any]:
+    prun_con = open_db(PRUN_DB)
+    try:
+        ensure_snapshot_table(prun_con)
+        ensure_market_stats_table(prun_con)
+        uni_quotes = fetch_all_quotes(prun_con, list(CX_ALL))
+        uni_rows: List[Any] = []
+        for q in uni_quotes:
+            sr = build_row(prun_con, q)
+            if sr:
+                insert_snapshot(prun_con, sr)
+                uni_rows.append(sr)
+        prun_con.commit()
+        persist_stats(prun_con, now_ms(), uni_rows)
+        return uni_rows
+    finally:
+        prun_con.close()
+
+def _rget(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+def _row_identity(sr) -> Tuple[str, str]:
+    return str(_rget(sr, "ticker")).upper(), str(_rget(sr, "cx")).upper()
+
+def _row_prices(sr) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    bid = _rget(sr, "best_bid")
+    ask = _rget(sr, "best_ask")
+    bid = float(bid) if bid is not None else None
+    ask = float(ask) if ask is not None else None
+    mid = ((bid + ask) / 2.0) if (bid is not None and ask is not None) else None
+    spr = (ask - bid) if (bid is not None and ask is not None) else None
+    return bid, ask, mid, spr
+
+def _eq(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None and b is None:
+        return True
+    if (a is None) != (b is None):
+        return False
+    return math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=1e-9)
+
+def _filter_changed_for_scope(rows: List[Any], scope: str, user_id: Optional[str]) -> List[Any]:
+    uid = "" if user_id is None else str(user_id)
+
+    con = open_report_state_db()
+    try:
+        ensure_report_state_table(con)
+
+        prev = {}
+        def _load_prev():
+            cur = con.execute(
+                "SELECT ticker,cx,last_bid,last_ask FROM report_state WHERE scope=? AND user_id=?",
+                (scope, uid)
+            )
+            return {(str(r["ticker"]).upper(), str(r["cx"]).upper()): (r["last_bid"], r["last_ask"]) for r in cur.fetchall()}
+
+        prev = _sql_retry(_load_prev)
+
+        changed: List[Any] = []
+        now = now_ms()
+        for sr in rows:
+            t, x = _row_identity(sr)
+            bid, ask, mid, spr = _row_prices(sr)
+            p_bid, p_ask = prev.get((t, x), (None, None))
+            if not (_eq(bid, p_bid) and _eq(ask, p_ask)):
+                changed.append(sr)
+
+            def _upsert():
+                con.execute("""
+                    INSERT INTO report_state(scope,user_id,ticker,cx,last_bid,last_ask,last_mid,last_spread,last_ts)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(scope,user_id,ticker,cx) DO UPDATE SET
+                        last_bid=excluded.last_bid,
+                        last_ask=excluded.last_ask,
+                        last_mid=excluded.last_mid,
+                        last_spread=excluded.last_spread,
+                        last_ts=excluded.last_ts
+                """, (scope, uid, t, x, bid, ask, mid, spr, now))
+                con.commit()
+            _sql_retry(_upsert)
+
+        return changed
+    finally:
+        con.close()
+
 # =========================
 # storage: snapshots and stats
 # =========================
@@ -94,6 +190,24 @@ def ensure_snapshot_tsiso_backfill(con: sqlite3.Connection):
     for rowid, ts in rows:
         iso = datetime.fromtimestamp(int(ts)/1000, tz=timezone.utc).isoformat(timespec="seconds")
         con.execute("UPDATE market_snapshot SET ts_iso=? WHERE rowid=?", (iso, rowid))
+    con.commit()
+
+# market.py — ensure table in the NEW DB
+def ensure_report_state_table(con: sqlite3.Connection) -> None:
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS report_state (
+        scope TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        cx TEXT NOT NULL,
+        last_bid REAL,
+        last_ask REAL,
+        last_mid REAL,
+        last_spread REAL,
+        last_ts INTEGER NOT NULL,
+        PRIMARY KEY (scope, user_id, ticker, cx)
+    )
+    """)
     con.commit()
 
 
@@ -136,6 +250,23 @@ def ensure_market_stats_table(con: sqlite3.Connection):
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_stats_cat_time ON market_stats(category, ts_ms)")
 
+def ensure_report_state_table(con: sqlite3.Connection) -> None:
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS report_state (
+        scope TEXT NOT NULL,              -- 'server' or 'user'
+        user_id TEXT NOT NULL,            -- '' for server
+        ticker TEXT NOT NULL,
+        cx TEXT NOT NULL,
+        last_bid REAL,
+        last_ask REAL,
+        last_mid REAL,
+        last_spread REAL,
+        last_ts INTEGER NOT NULL,
+        PRIMARY KEY (scope, user_id, ticker, cx)
+    )
+    """)
+    con.commit()
+
 def insert_snapshot(con: sqlite3.Connection, row: "SnapshotRow"):
     con.execute("""
     INSERT INTO market_snapshot(ts_ms,ts_iso,cx,ticker,pb,pa,spread,mid,PP7,PP30,dev7,dev30,z7)
@@ -150,6 +281,17 @@ def insert_snapshot(con: sqlite3.Connection, row: "SnapshotRow"):
 
 def fetch_last_snapshot(con: sqlite3.Connection, cx: str, ticker: str) -> Optional[sqlite3.Row]:
     return con.execute("SELECT pb,pa,spread FROM market_snapshot WHERE cx=? AND ticker=?", (cx, ticker)).fetchone()
+
+# market.py — ADD tiny retry helper
+def _sql_retry(fn, retries: int = 6, base_sleep: float = 0.15):
+    for i in range(retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower():
+                time.sleep(base_sleep * (i + 1))
+                continue
+            raise
 
 # =========================
 # inputs from prun.db
@@ -544,6 +686,15 @@ def load_all_user_watchlists(con: sqlite3.Connection) -> Dict[str, List[Tuple[st
         out.setdefault(key, []).append((str(tk).upper(), str(ex).upper()))
     return out
 
+def load_user_watchlist(con: sqlite3.Connection, user_id: str) -> List[Tuple[str, str]]:
+    if not table_exists(con, "user_watchlist"):
+        return []
+    rows = con.execute(
+        "SELECT ticker, COALESCE(exchange,'') FROM user_watchlist WHERE user_id=?",
+        (user_id,)
+    ).fetchall()
+    return [(str(t).upper(), str(x).upper()) for (t, x) in rows]
+
 def filter_rows_by_watchlist(rows: List[SnapshotRow], wl: List[Tuple[str, str]]) -> List[SnapshotRow]:
     if not wl:
         return []
@@ -562,6 +713,46 @@ def filter_rows_by_watchlist(rows: List[SnapshotRow], wl: List[Tuple[str, str]])
 # =========================
 # main
 # =========================
+def update_server_report() -> None:
+    ensure_dirs()
+    wl: List[Tuple[str, str]] = []
+    if os.path.exists(BOT_DB):
+        bot_con = open_db(BOT_DB)
+        try:
+            wl = load_server_watchlist(bot_con)
+        finally:
+            bot_con.close()
+    rows = _compile_universe_rows()
+    server_rows = filter_rows_by_watchlist(rows, wl)
+    changed = _filter_changed_for_scope(server_rows, scope="server", user_id=None)
+    if not changed:
+        # no changes → keep previous file to avoid posting noise
+        return
+    txt = render_watchlist_report(changed)
+    with open(REPORT_SERVER_PATH, "w", encoding="utf-8") as f:
+        f.write(txt)
+
+def update_user_report(user_id: str) -> None:
+    ensure_dirs()
+    wl: List[Tuple[str, str]] = []
+    if os.path.exists(BOT_DB):
+        bot_con = open_db(BOT_DB)
+        try:
+            wl = load_user_watchlist(bot_con, str(user_id))
+        finally:
+            bot_con.close()
+    rows = _compile_universe_rows()
+    u_rows = filter_rows_by_watchlist(rows, wl)
+    changed = _filter_changed_for_scope(u_rows, scope="user", user_id=str(user_id))
+    if not changed:
+        # no changes → keep previous file to avoid posting noise
+        return
+    txt = render_watchlist_report(changed)
+    udir = os.path.join(REPORT_USERS_DIR, str(user_id))
+    os.makedirs(udir, exist_ok=True)
+    with open(os.path.join(udir, "report.md"), "w", encoding="utf-8") as f:
+        f.write(txt)
+
 def main():
     ensure_dirs()
 
@@ -629,13 +820,13 @@ def main():
         prun_con.close()
 
 if __name__ == "__main__":
-    try:
-        while True:
-            t0 = time.time()
+    # try:
+    #     while True:
+    #         t0 = time.time()
             main()
-            t1 = time.time()
-            delta = 7200 - (t1 - t0)
-            print(f" ---- finish in {t1 - t0:2f}s - sleep for {delta}s ---- ")
-            time.sleep(delta)
-    except KeyboardInterrupt:
-        print(" Exiting Program ")
+    #         t1 = time.time()
+    #         delta = 300 - (t1 - t0)
+    #         print(f" ---- finish in {t1 - t0:2f}s - sleep for {delta}s ---- ")
+    #         time.sleep(delta)
+    # except KeyboardInterrupt:
+    #     print(" Exiting Program ")
