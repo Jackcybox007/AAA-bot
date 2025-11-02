@@ -145,4 +145,52 @@
 
 - Paths: `tmp/reports/server/report.md` and `tmp/reports/users/<id>/report.md`.
 - CX edges remain **raw** (no fees).
+<<<<<<< HEAD
 - Discord channel keeps the **last 3** server reports.
+=======
+- Discord channel keeps the **last 3** server reports.
+
+**🚀 AXO Market Sentinel — Update Log (02/11/2025)**
+
+**What’s New**
+
+1. **Order book ingestion**
+
+* Pulls `/csv/bids` and `/csv/orders` (no key).
+* Writes latest to `books` and 24h history to `books_hist`.
+* Computes `level` per snapshot: bids by price desc, asks by price asc. Ties keep CSV order.
+* Stores `company_id` as TEXT hash plus `company_name`, `company_code`.
+
+2. **MCP tools**
+
+* `ob_levels(cx,ticker,depth=20)` → aggregated top-N per side.
+* `ob_imbalance(cx,ticker,depth=10)` → [-1, 1] using top-N.
+* `ob_microprice(cx,ticker)` → size-weighted microprice from best bid/ask.
+* `ob_support_resistance(cx,ticker,mode='book'|'history',cluster=1.0,top=3,lookback_h=168)`.
+
+3. **@mention routing**
+
+* Replies to n8n-sourced messages now prefix `<@discordId>` in public and private.
+
+4. **Lock avoidance and timing**
+
+* Staggered loops: report loops offset by `POLL_SECS/2` with ±10% jitter.
+* Single-transaction batched upserts per poll.
+* Readers use short-lived connections.
+
+5. **Schema and indexes**
+
+* `books` adds `level`, `company_id`, `company_name`, `company_code`.
+* New `books_hist` with indexes on `(cx,ticker,side,ts)`, `(cx,ticker,side,level,ts)`, `(cx,ticker,side,price,ts)`.
+
+**Fixes**
+
+* Reduced `database is locked` in `market_report_loop` and `user_private_loop` via timing and PRAGMAs (`WAL`, `synchronous=NORMAL`, `busy_timeout=20000` on every connect).
+
+**Notes**
+
+* Imbalance default depth is 10; pass any depth as needed.
+* S/R: `mode='book'` clusters by 1.0-credit bins; `mode='history'` uses swing highs/lows.
+* Order-book history retention: 24h with rolling cleanup.
+
+>>>>>>> 635973c (Implement some small fix with database and add order book related tools. #004)

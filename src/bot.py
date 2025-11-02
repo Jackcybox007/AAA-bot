@@ -637,6 +637,7 @@ async def market_report_loop():
 @market_report_loop.before_loop
 async def before_market_report():
     await bot.wait_until_ready()
+    await asyncio.sleep(max(1, MARKET_POLL_SECS//2))
 
 @tasks.loop(seconds=USER_REPORT_SECS)
 async def user_private_loop():
@@ -700,6 +701,7 @@ async def user_private_loop():
 @user_private_loop.before_loop
 async def before_user_private():
     await bot.wait_until_ready()
+    await asyncio.sleep(3)
 
 # ========= HTTP inbound bridge (also releases user locks) =========
 async def handle_health(request: web.Request) -> web.StreamResponse:
@@ -746,6 +748,9 @@ async def handle_incoming(request: web.Request) -> web.StreamResponse:
         except Exception:
             pass
         return web.json_response({"ok": False, "error": "channel_not_found"}, status=404)
+
+    mention = f"<@{discord_id}> \n" if discord_id.isdigit() else ""
+    msg_text = (mention + msg_text) if mention else msg_text
 
     try:
         if len(msg_text) > MAX_DISCORD_MSG_LEN:

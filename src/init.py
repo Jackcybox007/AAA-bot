@@ -31,40 +31,36 @@ log = config.setup_logging("init")
 PUBLIC_SCHEMA = """
 PRAGMA journal_mode=WAL;
 
--- Public market data tables
 CREATE TABLE IF NOT EXISTS prices(
   cx        TEXT NOT NULL,
   ticker    TEXT NOT NULL,
   best_bid  REAL,
   best_ask  REAL,
-  PP7       REAL,            -- rolling 7d mid
-  PP30      REAL,            -- rolling 30d mid
+  PP7       REAL,
+  PP30      REAL,
   ts        INTEGER NOT NULL,
   PRIMARY KEY(cx, ticker)
 );
 
 CREATE TABLE IF NOT EXISTS price_history(
-  cx        TEXT NOT NULL,
-  ticker    TEXT NOT NULL,
-  bid       REAL,
-  ask       REAL,
-  ts        INTEGER NOT NULL,
+  cx     TEXT NOT NULL,
+  ticker TEXT NOT NULL,
+  bid    REAL,
+  ask    REAL,
+  ts     INTEGER NOT NULL,
   PRIMARY KEY(cx, ticker, ts)
 );
 
 CREATE TABLE IF NOT EXISTS prices_chart_history(
-  cx        TEXT    NOT NULL,
-  ticker    TEXT    NOT NULL,
-  mat_id    INTEGER NOT NULL,
-  interval  TEXT    NOT NULL,   -- MINUTE_FIVE or HOUR_TWO
-  ts        INTEGER NOT NULL,   -- DateEpochMs
-  open      REAL,
-  close     REAL,
-  high      REAL,
-  low       REAL,
-  volume    REAL,
-  traded    INTEGER,
-  PRIMARY KEY(cx, ticker, interval, ts)
+  cx       TEXT NOT NULL,
+  ticker   TEXT NOT NULL,
+  interval INTEGER NOT NULL,
+  ts       INTEGER NOT NULL,
+  open     REAL,
+  close    REAL,
+  volume   REAL,
+  traded   INTEGER,
+  PRIMARY KEY(cx,ticker,interval,ts)
 );
 
 CREATE TABLE IF NOT EXISTS materials(
@@ -76,24 +72,29 @@ CREATE TABLE IF NOT EXISTS materials(
 );
 
 CREATE TABLE IF NOT EXISTS books(
-  cx     TEXT NOT NULL,
-  ticker TEXT NOT NULL,
-  side   TEXT NOT NULL CHECK(side IN('bid','ask')),
-  price  REAL NOT NULL,
-  qty    REAL NOT NULL,
-  ts     INTEGER NOT NULL,
+  cx           TEXT NOT NULL,
+  ticker       TEXT NOT NULL,
+  side         TEXT NOT NULL CHECK(side IN('bid','ask')),
+  price        REAL NOT NULL,
+  qty          REAL NOT NULL,
+  level        INTEGER,
+  company_id   TEXT,
+  company_name TEXT,
+  company_code TEXT,
+  ts           INTEGER NOT NULL,
   PRIMARY KEY(cx, ticker, side, price)
 );
 
--- HTTP metadata cache for conditional GETs
+CREATE INDEX IF NOT EXISTS ix_books_cx_ticker ON books(cx, ticker);
+CREATE INDEX IF NOT EXISTS ix_books_side_price ON books(side, price);
+CREATE INDEX IF NOT EXISTS ix_books_ts ON books(ts);
+
 CREATE TABLE IF NOT EXISTS http_cache(
-  url            TEXT PRIMARY KEY,
-  etag           TEXT,
-  last_modified  TEXT,
-  fetched_ts     INTEGER
+  url TEXT PRIMARY KEY,
+  ts  INTEGER NOT NULL,
+  body BLOB
 );
 
--- Snapshot table used by reporting
 CREATE TABLE IF NOT EXISTS market_snapshot(
   ts_ms   INTEGER NOT NULL,
   ts_iso  TEXT    NOT NULL,
@@ -112,25 +113,15 @@ CREATE TABLE IF NOT EXISTS market_snapshot(
 CREATE UNIQUE INDEX IF NOT EXISTS ux_market_snapshot_cx_ticker ON market_snapshot(cx, ticker);
 CREATE INDEX IF NOT EXISTS idx_snapshot_time ON market_snapshot(ts_ms);
 
--- Aggregated market statistics per run
 CREATE TABLE IF NOT EXISTS market_stats(
   ts_ms    INTEGER NOT NULL,
-  category TEXT    NOT NULL,  -- 'top_movers','best_pct_spread','arb_margin','maker_profit'
+  category TEXT    NOT NULL,
   rank     INTEGER NOT NULL,
   cx       TEXT,
   ticker   TEXT,
-  value    REAL,              -- main score (e.g., % or z or margin%)
-  aux      REAL,              -- secondary (e.g., profit_per_unit)
-  note     TEXT,              -- e.g., "NC1->IC1"
-  PRIMARY KEY (ts_ms, category, rank, cx, ticker)
+  value    REAL,
+  PRIMARY KEY(ts_ms, category, rank)
 );
-CREATE INDEX IF NOT EXISTS idx_stats_cat_time ON market_stats(category, ts_ms);
-
--- Indexes
-CREATE INDEX IF NOT EXISTS ix_price_history_ts ON price_history(ts);
-CREATE INDEX IF NOT EXISTS ix_books_cx_ticker ON books(cx, ticker);
-CREATE INDEX IF NOT EXISTS ix_books_side_price ON books(side, price);
-CREATE INDEX IF NOT EXISTS ix_pch_ts ON prices_chart_history(ts);
 """
 
 PRIVATE_SCHEMA = """
@@ -281,6 +272,44 @@ async def check_database_exists(db_path: str) -> bool:
     except Exception:
         return False
 
+async def _column_exists(con: aiosqlite.Connection, table: str, column: str) -> bool:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == column for r in rows)
+    except Exception:
+        return False
+
+async def migrate_books_schema(con: aiosqlite.Connection):
+    cols = {
+        "level": "INTEGER",
+        "company_id": "TEXT",
+        "company_name": "TEXT",
+        "company_code": "TEXT"
+    }
+    for c, typ in cols.items():
+        try:
+            if not _column_exists(con, "books", c):
+                con.execute(f"ALTER TABLE books ADD COLUMN {c} {typ}")
+        except Exception:
+            pass
+    con.executescript("""
+CREATE TABLE IF NOT EXISTS books_hist(
+  cx           TEXT NOT NULL,
+  ticker       TEXT NOT NULL,
+  side         TEXT NOT NULL CHECK(side IN('bid','ask')),
+  price        REAL NOT NULL,
+  qty          REAL NOT NULL,
+  level        INTEGER,
+  company_id   TEXT,
+  company_name TEXT,
+  company_code TEXT,
+  ts           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_books_hist_cts   ON books_hist(cx,ticker,side,ts);
+CREATE INDEX IF NOT EXISTS ix_books_hist_lvl   ON books_hist(cx,ticker,side,level,ts);
+CREATE INDEX IF NOT EXISTS ix_books_hist_price ON books_hist(cx,ticker,side,price,ts);
+""")
+
 # =========================
 # Main
 # =========================
@@ -317,6 +346,15 @@ async def main():
             log.info("Successfully initialized MCP helper tables")
         except Exception as e:
             log.error(f"Failed to initialize MCP helper tables: {e}")
+
+    if db["path"] == config.DB_PATH:
+      try:
+          con = aiosqlite.connect(config.DB_PATH)
+          migrate_books_schema(con)
+          con.commit(); con.close()
+          log.info("Post-migration on books done")
+      except Exception as e:
+          log.error(f"Post-migration failed: {e}")
 
     if success_count == total_count:
         log.info(f"Successfully initialized all {total_count} databases")

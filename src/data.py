@@ -360,6 +360,59 @@ async def ensure_prices_chart_schema(pub: aiosqlite.Connection):
 async def ensure_http_cache(pub: aiosqlite.Connection):
     await pub.executescript(HTTP_CACHE_SCHEMA); await pub.commit()
 
+async def ensure_books_schema(pub: aiosqlite.Connection):
+    # Create books if missing
+    await pub.execute("""
+    CREATE TABLE IF NOT EXISTS books(
+      cx           TEXT NOT NULL,
+      ticker       TEXT NOT NULL,
+      side         TEXT NOT NULL CHECK(side IN('bid','ask')),
+      price        REAL NOT NULL,
+      qty          REAL NOT NULL,
+      level        INTEGER,
+      company_id   TEXT,
+      company_name TEXT,
+      company_code TEXT,
+      ts           INTEGER NOT NULL,
+      PRIMARY KEY(cx, ticker, side, price)
+    )""")
+    await pub.execute("CREATE INDEX IF NOT EXISTS ix_books_cx_ticker ON books(cx, ticker)")
+    await pub.execute("CREATE INDEX IF NOT EXISTS ix_books_ts ON books(ts)")
+
+    # Add columns defensively in case an older books table exists
+    async with pub.execute("PRAGMA table_info(books)") as cur:
+        cols = { (row[1] or "").lower() async for row in cur }  # name at index 1
+    for col, ddl in [
+        ("level",        "ALTER TABLE books ADD COLUMN level INTEGER"),
+        ("company_id",   "ALTER TABLE books ADD COLUMN company_id TEXT"),
+        ("company_name", "ALTER TABLE books ADD COLUMN company_name TEXT"),
+        ("company_code", "ALTER TABLE books ADD COLUMN company_code TEXT"),
+    ]:
+        if col not in cols:
+            try:
+                await pub.execute(ddl)
+            except Exception:
+                pass
+
+    # Create history table + indexes
+    await pub.execute("""
+    CREATE TABLE IF NOT EXISTS books_hist(
+      cx           TEXT NOT NULL,
+      ticker       TEXT NOT NULL,
+      side         TEXT NOT NULL CHECK(side IN('bid','ask')),
+      price        REAL NOT NULL,
+      qty          REAL NOT NULL,
+      level        INTEGER,
+      company_id   TEXT,
+      company_name TEXT,
+      company_code TEXT,
+      ts           INTEGER NOT NULL
+    )""")
+    await pub.execute("CREATE INDEX IF NOT EXISTS ix_books_hist_cts   ON books_hist(cx,ticker,side,ts)")
+    await pub.execute("CREATE INDEX IF NOT EXISTS ix_books_hist_lvl   ON books_hist(cx,ticker,side,level,ts)")
+    await pub.execute("CREATE INDEX IF NOT EXISTS ix_books_hist_price ON books_hist(cx,ticker,side,price,ts)")
+    await pub.commit()
+
 async def _http_cache_get(pub: aiosqlite.Connection, url: str) -> Tuple[Optional[str], Optional[str]]:
     row = await (await pub.execute("SELECT etag,last_modified FROM http_cache WHERE url=?", (url,))).fetchone()
     return (row[0], row[1]) if row else (None, None)
@@ -373,14 +426,23 @@ async def _http_cache_put(pub: aiosqlite.Connection, url: str, etag: Optional[st
 
 async def init_dbs():
     pub = await aiosqlite.connect(PRUN_DB_PATH)
+    await pub.execute("PRAGMA busy_timeout=20000")
+    await pub.execute("PRAGMA journal_mode=WAL")
+    await pub.execute("PRAGMA synchronous=NORMAL")
     await pub.executescript(PUB_SCHEMA); await pub.commit()
     await ensure_lm_ship_schema(pub)
     await ensure_http_cache(pub)  # add
 
     pvt = await aiosqlite.connect(PVT_DB_PATH)
+    await pvt.execute("PRAGMA busy_timeout=20000")
+    await pvt.execute("PRAGMA journal_mode=WAL")
+    await pvt.execute("PRAGMA synchronous=NORMAL")
     await ensure_private_schema(pvt)
 
     users = await aiosqlite.connect(USER_DB_PATH)
+    await users.execute("PRAGMA busy_timeout=20000")
+    await users.execute("PRAGMA journal_mode=WAL")
+    await users.execute("PRAGMA synchronous=NORMAL")
     return pub, pvt, users
 
 
@@ -675,6 +737,76 @@ async def load_public_prices_chart_history(session: aiohttp.ClientSession, pub: 
     await pub.execute("DELETE FROM prices_chart_history WHERE interval='HOUR_TWO' AND ts<?", (cutoff_2h,))
     await pub.commit()
 
+async def load_public_orderbooks(session: aiohttp.ClientSession, pub: aiosqlite.Connection):
+    ts = _now_ms()
+    bids_rows, asks_rows = await asyncio.gather(
+        fetch_csv(session, f"{PUBLIC_BASE}/csv/bids"),
+        fetch_csv(session, f"{PUBLIC_BASE}/csv/orders")
+    )
+    def _norm(rows, side):
+        out = []
+        for r in rows or []:
+            ticker = _to_str(r.get("MaterialTicker")).upper()
+            cx     = _to_str(r.get("ExchangeCode")).upper()
+            if not ticker or not cx:
+                continue
+            price  = _to_float(r.get("ItemCost"))
+            qty    = _to_float(r.get("ItemCount"))
+            if price is None or qty is None or qty <= 0:
+                continue
+            out.append({
+                "ticker": ticker, "cx": cx, "side": side,
+                "price": float(price), "qty": float(qty),
+                "company_id": _to_str(r.get("CompanyId")),
+                "company_name": _to_str(r.get("CompanyName")),
+                "company_code": _to_str(r.get("CompanyCode")),
+                "_ord": len(out)
+            })
+        return out
+    bids = _norm(bids_rows, "bid")
+    asks = _norm(asks_rows, "ask")
+
+    grouped = {}
+    for row in bids + asks:
+        key = (row["cx"], row["ticker"], row["side"])
+        grouped.setdefault(key, []).append(row)
+
+    for key, rows in grouped.items():
+        side = key[2]
+        rev = (side == "bid")
+        rows.sort(key=lambda r: r["price"], reverse=rev)  # stable sort, ties keep file order
+        for lev, r in enumerate(rows, start=1):
+            r["level"] = lev
+
+    books_vals, hist_vals = [], []
+    for rows in grouped.values():
+        for r in rows:
+            t = (r["cx"], r["ticker"], r["side"], r["price"], r["qty"], r["level"],
+                 r["company_id"], r["company_name"], r["company_code"], ts)
+            hist_vals.append(t)
+            books_vals.append(t)
+
+    if not books_vals:
+        return
+
+    await pub.execute("BEGIN")
+    await pub.executemany(
+        "INSERT INTO books(cx,ticker,side,price,qty,level,company_id,company_name,company_code,ts) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(cx,ticker,side,price) DO UPDATE SET "
+        "qty=excluded.qty, level=excluded.level, company_id=excluded.company_id, "
+        "company_name=excluded.company_name, company_code=excluded.company_code, ts=excluded.ts",
+        books_vals
+    )
+    await pub.executemany(
+        "INSERT INTO books_hist(cx,ticker,side,price,qty,level,company_id,company_name,company_code,ts) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        hist_vals
+    )
+    cutoff = ts - 24*3600*1000
+    await pub.execute("DELETE FROM books_hist WHERE ts < ?", (cutoff,))
+    await pub.commit()
+
 # ---- Local Market (planets → buy/sell/ship) ----
 async def _planet_ids(session: aiohttp.ClientSession) -> List[str]:
     rows = await fetch_csv(session, f"{PUBLIC_BASE}/csv/planets")
@@ -964,6 +1096,10 @@ async def load_public(pub):
         await load_public_localmarket(session, pub)
     except Exception as e:
         log.error(f"localmarket error: {e}")
+    try:
+        await load_public_orderbooks(session, pub)
+    except Exception as e:
+        log.error(f"orderbooks error: {e}")
 
     log.info(f"public cycle took {(time.time()-t0):.2f}s")
 
@@ -991,6 +1127,7 @@ async def loop_main():
     global session
     log.info(f"BOOT PUBLIC_BASE={PUBLIC_BASE} PRIVATE_BASE={PRIVATE_BASE} POLL_SECS={POLL_SECS} RETENTION_DAYS={RETENTION_SEC/86400:.1f}")
     pub, pvt, users = await init_dbs()
+    await ensure_books_schema(pub)
     # high-conn pool + keepalive + DNS cache
     conn = aiohttp.TCPConnector(limit=HTTP_MAX_CONNECTIONS, limit_per_host=0, ttl_dns_cache=300, enable_cleanup_closed=True, ssl=False)
     timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=40)

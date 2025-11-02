@@ -9,9 +9,9 @@ over HTTP. Provides comprehensive market data analysis, asset management,
 and trading tools for Prosperous Universe.
 
 Notes:
-- Works with the public DB schema: prices(cx,ticker,best_bid,best_ask,PP7,PP30,ts),
+- Uses public DB schema: prices(cx,ticker,best_bid,best_ask,PP7,PP30,ts),
   price_history(cx,ticker,bid,ask,ts), materials(ticker,name,category,weight,volume).
-- No dependency on an order-book ("books") table or a "last" column.
+- Order-book tools read from books and books_hist if present.
 """
 
 # Standard library imports
@@ -23,7 +23,10 @@ import os
 import signal
 import sqlite3
 import sys
+<<<<<<< HEAD
 import json
+=======
+>>>>>>> 635973c (Implement some small fix with database and add order book related tools. #004)
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -57,23 +60,35 @@ log = config.setup_logging("prun-mcp")
 
 mcp = FastMCP(
     "prun-market-mcp",
-    instructions="Prosperous Universe market tools for analysis, assets, order planning, and history.",
+    instructions="Prosperous Universe market tools for analysis, assets, order planning, history, and order books.",
     stateless_http=True,
 )
 
 # -------- DB helpers --------
 def db():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=20.0)
+    try:
+        con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA synchronous=NORMAL"); con.execute("PRAGMA busy_timeout=20000")
+    except Exception:
+        pass
     con.row_factory = sqlite3.Row
     return con
 
 def pdb():
-    con = sqlite3.connect(PRIVATE_DB)
+    con = sqlite3.connect(PRIVATE_DB, timeout=20.0)
+    try:
+        con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA synchronous=NORMAL"); con.execute("PRAGMA busy_timeout=20000")
+    except Exception:
+        pass
     con.row_factory = sqlite3.Row
     return con
 
 def udb():
-    con = sqlite3.connect(USER_DB)
+    con = sqlite3.connect(USER_DB, timeout=20.0)
+    try:
+        con.execute("PRAGMA journal_mode=WAL"); con.execute("PRAGMA synchronous=NORMAL"); con.execute("PRAGMA busy_timeout=20000")
+    except Exception:
+        pass
     con.row_factory = sqlite3.Row
     return con
 
@@ -239,8 +254,12 @@ def health() -> Dict[str, Any]:
         has_priv_o = p.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='user_cxos'").fetchone()[0] > 0
         has_priv_b = p.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='user_balances'").fetchone()[0] > 0
         has_users  = u.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='users'").fetchone()[0] > 0
+        # order-book presence
+        has_books      = m.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='books'").fetchone()[0] > 0
+        has_books_hist = m.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='books_hist'").fetchone()[0] > 0
         return {"ok": True, "db_public": DB_PATH, "db_private": PRIVATE_DB, "db_users": USER_DB,
                 "has_prices": has_prices, "has_history": has_hist,
+                "has_books": has_books, "has_books_hist": has_books_hist,
                 "has_private_inventory": has_priv_i, "has_private_cxos": has_priv_o, "has_private_balances": has_priv_b,
                 "has_users": has_users, "bucket_ms": HIST_BUCKET_SECS*1000, "time": now_iso()}
     finally:
@@ -935,6 +954,351 @@ def users_info_search(query: str, limit: int = 20) -> Dict[str, Any]:
 
     return {"path": USER_JSON_PATH, "exists": True, "count": len(matches), "rows": matches}
 
+<<<<<<< HEAD
+=======
+# ====================== ORDER BOOK TOOLS ======================
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _latest_ts_for_side(c: sqlite3.Connection, cx: str, ticker: str, side: str) -> Optional[int]:
+    cur = c.execute(
+        "SELECT MAX(ts) AS ts FROM books_hist WHERE cx=? AND ticker=? AND side=?",
+        (cx.upper(), ticker.upper(), side)
+    ).fetchone()
+    if cur and cur["ts"]:
+        return int(cur["ts"])
+    cur = c.execute(
+        "SELECT MAX(ts) AS ts FROM books WHERE cx=? AND ticker=? AND side=?",
+        (cx.upper(), ticker.upper(), side)
+    ).fetchone()
+    return int(cur["ts"]) if cur and cur["ts"] else None
+
+def _levels_aggregated(
+    c: sqlite3.Connection,
+    cx: str,
+    ticker: str,
+    side: Literal["bid","ask"],
+    depth: int
+) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+    """
+    Return latest timestamp and top-N aggregated price levels for a side.
+    Aggregation: sum qty per price at the latest snapshot ts.
+    Ordering: bids desc, asks asc. Levels start at 1.
+    """
+    ts = _latest_ts_for_side(c, cx, ticker, side)
+    if ts is None:
+        return (None, [])
+    order = "DESC" if side == "bid" else "ASC"
+
+    rows = c.execute(
+        f"""
+        SELECT price, SUM(qty) AS qty
+        FROM books_hist
+        WHERE cx=? AND ticker=? AND side=? AND ts=?
+        GROUP BY price
+        ORDER BY price {order}
+        LIMIT ?
+        """,
+        (cx.upper(), ticker.upper(), side, ts, depth)
+    ).fetchall()
+    if not rows:
+        rows = c.execute(
+            f"""
+            SELECT price, SUM(qty) AS qty
+            FROM books
+            WHERE cx=? AND ticker=? AND side=?
+            GROUP BY price
+            ORDER BY price {order}
+            LIMIT ?
+            """,
+            (cx.upper(), ticker.upper(), side, depth)
+        ).fetchall()
+
+    out: List[Dict[str, Any]] = []
+    for idx, r in enumerate(rows, start=1):
+        out.append({
+            "level": idx,
+            "price": float(r["price"]),
+            "qty": float(r["qty"]),
+        })
+    return (ts, out)
+
+def _best_price_and_size(
+    c: sqlite3.Connection, cx: str, ticker: str, side: Literal["bid","ask"]
+) -> Tuple[Optional[int], Optional[float], float]:
+    """
+    Best price and total size at that price from latest snapshot.
+    Returns (ts, price, size). price None if side empty.
+    """
+    ts = _latest_ts_for_side(c, cx, ticker, side)
+    if ts is None:
+        return (None, None, 0.0)
+
+    if side == "bid":
+        pr = c.execute(
+            "SELECT MAX(price) AS p FROM books_hist WHERE cx=? AND ticker=? AND side=? AND ts=?",
+            (cx.upper(), ticker.upper(), side, ts)
+        ).fetchone()
+    else:
+        pr = c.execute(
+            "SELECT MIN(price) AS p FROM books_hist WHERE cx=? AND ticker=? AND side=? AND ts=?",
+            (cx.upper(), ticker.upper(), side, ts)
+        ).fetchone()
+
+    price = float(pr["p"]) if pr and pr["p"] is not None else None
+    if price is None:
+        # Fallback to books
+        if side == "bid":
+            pr = c.execute(
+                "SELECT MAX(price) AS p FROM books WHERE cx=? AND ticker=? AND side=?",
+                (cx.upper(), ticker.upper(), side)
+            ).fetchone()
+        else:
+            pr = c.execute(
+                "SELECT MIN(price) AS p FROM books WHERE cx=? AND ticker=? AND side=?",
+                (cx.upper(), ticker.upper(), side)
+            ).fetchone()
+        price = float(pr["p"]) if pr and pr["p"] is not None else None
+        if price is None:
+            return (ts, None, 0.0)
+        q = c.execute(
+            "SELECT SUM(qty) AS sz FROM books WHERE cx=? AND ticker=? AND side=? AND price=?",
+            (cx.upper(), ticker.upper(), side, price)
+        ).fetchone()
+        return (ts, price, float(q["sz"] or 0.0))
+
+    q = c.execute(
+        "SELECT SUM(qty) AS sz FROM books_hist WHERE cx=? AND ticker=? AND side=? AND ts=? AND price=?",
+        (cx.upper(), ticker.upper(), side, ts, price)
+    ).fetchone()
+    return (ts, price, float(q["sz"] or 0.0))
+
+def _snapshot_rows(c: sqlite3.Connection, cx: str, ticker: str, side: Literal["bid","ask"]) -> Tuple[Optional[int], List[Tuple[float, float]]]:
+    ts = _latest_ts_for_side(c, cx, ticker, side)
+    if ts is None:
+        return (None, [])
+    rows = c.execute(
+        "SELECT price, qty FROM books_hist WHERE cx=? AND ticker=? AND side=? AND ts=?",
+        (cx.upper(), ticker.upper(), side, ts)
+    ).fetchall()
+    if not rows:
+        rows = c.execute(
+            "SELECT price, qty FROM books WHERE cx=? AND ticker=? AND side=?",
+            (cx.upper(), ticker.upper(), side)
+        ).fetchall()
+    return (ts, [(float(r["price"]), float(r["qty"])) for r in rows])
+
+def _cluster_bins(rows: List[Tuple[float, float]], bin_size: float) -> List[Dict[str, float]]:
+    """
+    rows: list of (price, qty) at latest snapshot for one side.
+    bin_size: cluster width in credits. Must be > 0.
+    Returns sorted clusters by total qty desc. Each cluster has:
+      {"qty": total_qty, "price": weighted_avg_price, "bin_lo": lo, "bin_hi": hi}
+    """
+    if not rows or bin_size <= 0:
+        return []
+    bins: Dict[int, Dict[str, float]] = {}
+    for price, qty in rows:
+        key = int(math.floor(price / bin_size))
+        lo = key * bin_size
+        hi = lo + bin_size
+        b = bins.setdefault(key, {"qty": 0.0, "wpx": 0.0, "lo": lo, "hi": hi})
+        b["qty"] += qty
+        b["wpx"] += price * qty
+    clusters: List[Dict[str, float]] = []
+    for b in bins.values():
+        price = (b["wpx"] / b["qty"]) if b["qty"] > 0 else (b["lo"] + b["hi"]) / 2.0
+        clusters.append({"qty": b["qty"], "price": price, "bin_lo": b["lo"], "bin_hi": b["hi"]})
+    clusters.sort(key=lambda x: (-x["qty"], x["price"]))
+    return clusters
+
+# --------- Public Order-Book Tools ---------
+
+@mcp.tool(description="Order book levels. Top-N price levels per side at latest snapshot. Aggregated by price.")
+def ob_levels(cx: str, ticker: str, depth: int = 20) -> Dict[str, Any]:
+    cx = cx.upper().strip()
+    ticker = ticker.upper().strip()
+    depth = max(1, int(depth))
+
+    with db() as c:
+        ts_b, bids = _levels_aggregated(c, cx, ticker, "bid", depth)
+        ts_a, asks = _levels_aggregated(c, cx, ticker, "ask", depth)
+    ts = max([t for t in [ts_b, ts_a] if t is not None], default=None)
+
+    return {
+        "cx": cx,
+        "ticker": ticker,
+        "ts": ts,
+        "bids": bids,
+        "asks": asks,
+    }
+
+@mcp.tool(description="Order book imbalance over top-N price levels at latest snapshot. Returns imbalance in [-1,1].")
+def ob_imbalance(cx: str, ticker: str, depth: int = 10) -> Dict[str, Any]:
+    cx = cx.upper().strip()
+    ticker = ticker.upper().strip()
+    depth = max(1, int(depth))
+
+    with db() as c:
+        ts_b, bids = _levels_aggregated(c, cx, ticker, "bid", depth)
+        ts_a, asks = _levels_aggregated(c, cx, ticker, "ask", depth)
+
+    bvol = float(sum(l["qty"] for l in bids))
+    avol = float(sum(l["qty"] for l in asks))
+    denom = bvol + avol
+    imb = None if denom == 0 else (bvol - avol) / denom
+    ts = max([t for t in [ts_b, ts_a] if t is not None], default=None)
+
+    return {
+        "cx": cx,
+        "ticker": ticker,
+        "ts": ts,
+        "depth": depth,
+        "bid_vol": bvol,
+        "ask_vol": avol,
+        "imbalance": imb,
+    }
+
+@mcp.tool(description="Microprice using aggregated size at best bid/ask. Returns bests and microprice.")
+def ob_microprice(cx: str, ticker: str) -> Dict[str, Any]:
+    cx = cx.upper().strip()
+    ticker = ticker.upper().strip()
+    with db() as c:
+        ts_b, bb, bsz = _best_price_and_size(c, cx, ticker, "bid")
+        ts_a, ba, asz = _best_price_and_size(c, cx, ticker, "ask")
+    ts = max([t for t in [ts_b, ts_a] if t is not None], default=None)
+
+    micro = None
+    if bb is not None and ba is not None and (bsz + asz) > 0:
+        micro = (ba * bsz + bb * asz) / (bsz + asz)
+
+    return {
+        "cx": cx,
+        "ticker": ticker,
+        "ts": ts,
+        "best_bid": bb,
+        "best_ask": ba,
+        "bid_size": bsz,
+        "ask_size": asz,
+        "microprice": micro,
+    }
+
+@mcp.tool(description="Support/Resistance from order book clusters or recent price history.")
+def ob_support_resistance(
+    cx: str,
+    ticker: str,
+    mode: Literal["book","history"] = "book",
+    cluster: float = 1.0,
+    top: int = 3,
+    lookback_h: int = 168
+) -> Dict[str, Any]:
+    cx = cx.upper().strip()
+    ticker = ticker.upper().strip()
+    top = max(1, int(top))
+
+    if mode == "book":
+        cluster = float(cluster if cluster and cluster > 0 else 1.0)
+        with db() as c:
+            ts_b, bid_rows = _snapshot_rows(c, cx, ticker, "bid")
+            ts_a, ask_rows = _snapshot_rows(c, cx, ticker, "ask")
+        ts = max([t for t in [ts_b, ts_a] if t is not None], default=None)
+
+        bid_clusters = _cluster_bins(bid_rows, cluster)[:top]
+        ask_clusters = _cluster_bins(ask_rows, cluster)[:top]
+
+        supports = [{"price": round(x["price"], 2), "size": x["qty"], "bin": [x["bin_lo"], x["bin_hi"]]} for x in bid_clusters]
+        resistances = [{"price": round(x["price"], 2), "size": x["qty"], "bin": [x["bin_lo"], x["bin_hi"]]} for x in ask_clusters]
+
+        return {
+            "cx": cx, "ticker": ticker, "ts": ts,
+            "mode": "book", "cluster": cluster, "top": top,
+            "supports": supports, "resistances": resistances
+        }
+
+    # mode == 'history'
+    now_ms = _now_ms()
+    look_ms = int(lookback_h) * 3600_000
+    start = now_ms - look_ms
+
+    with db() as c:
+        rows = c.execute(
+            """
+            SELECT ts, bid, ask
+            FROM price_history
+            WHERE cx=? AND ticker=? AND ts>=?
+            ORDER BY ts ASC
+            """,
+            (cx, ticker, start)
+        ).fetchall()
+
+    if not rows:
+        return {
+            "cx": cx, "ticker": ticker, "ts": None,
+            "mode": "history", "lookback_h": lookback_h,
+            "supports": [], "resistances": []
+        }
+
+    # Build mid prices when both sides exist, fallback to available side
+    series: List[Tuple[int, float]] = []
+    for r in rows:
+        b = r["bid"]; a = r["ask"]
+        price = None
+        if b is not None and a is not None:
+            price = (float(b) + float(a)) / 2.0
+        elif b is not None:
+            price = float(b)
+        elif a is not None:
+            price = float(a)
+        if price is not None:
+            series.append((int(r["ts"]), price))
+
+    # Find swing highs/lows using a small neighborhood
+    k = 3
+    highs: List[Tuple[float, int]] = []
+    lows: List[Tuple[float, int]] = []
+    for i in range(k, len(series) - k):
+        p = series[i][1]
+        left = [series[j][1] for j in range(i - k, i)]
+        right = [series[j][1] for j in range(i + 1, i + 1 + k)]
+        if all(p >= x for x in left + right):
+            highs.append((p, series[i][0]))
+        if all(p <= x for x in left + right):
+            lows.append((p, series[i][0]))
+
+    # Cluster highs and lows into bands
+    def cluster_points(points: List[Tuple[float, int]], bands: int = 50) -> List[Dict[str, float]]:
+        if not points:
+            return []
+        ps = [p for p, _ in points]
+        pmin, pmax = min(ps), max(ps)
+        if pmax == pmin:
+            return [{"price": pmin, "size": float(len(points))}]
+        width = max(1e-9, (pmax - pmin) / bands)
+        buckets: Dict[int, Dict[str, float]] = {}
+        for price, _ts in points:
+            key = int(math.floor((price - pmin) / width))
+            b = buckets.setdefault(key, {"size": 0.0, "wpx": 0.0})
+            b["size"] += 1.0
+            b["wpx"] += price
+        cl: List[Dict[str, float]] = []
+        for b in buckets.values():
+            cl.append({"price": b["wpx"]/max(1.0,b["size"]), "size": b["size"]})
+        cl.sort(key=lambda x: (-x["size"], x["price"]))
+        return cl
+
+    r_buckets = cluster_points(highs)[:top]
+    s_buckets = cluster_points(lows)[:top]
+
+    resistances = [{"price": round(x["price"], 2), "touches": x["size"]} for x in r_buckets]
+    supports    = [{"price": round(x["price"], 2), "touches": x["size"]} for x in s_buckets]
+
+    return {
+        "cx": cx, "ticker": ticker, "ts": series[-1][0],
+        "mode": "history", "lookback_h": lookback_h,
+        "supports": supports, "resistances": resistances
+    }
+>>>>>>> 635973c (Implement some small fix with database and add order book related tools. #004)
 
 # ====================== SERVER START ======================
 if __name__ == "__main__":

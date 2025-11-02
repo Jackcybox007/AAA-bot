@@ -39,7 +39,21 @@ def ensure_dirs():
     os.makedirs(REPORT_USERS_DIR, exist_ok=True)
 
 def open_db(path: str) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
+    con = sqlite3.connect(path, timeout=20.0)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA busy_timeout=20000")
+    except Exception:
+        pass
+    con.row_factory = sqlite3.Row
+    return con
+
+def open_report_state_db() -> sqlite3.Connection:
+    con = sqlite3.connect(REPORT_STATE_DB, timeout=5.0)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA busy_timeout=5000")
     con.row_factory = sqlite3.Row
     return con
 
